@@ -2624,6 +2624,7 @@ jobs:
           printf '%s\n%s' "$VPN_USERNAME" "$VPN_PASSWORD" > auth.txt
 
           printf '%s' "$VPN_CONFIG" > proton.ovpn
+          sed -i 's/^auth-user-pass$/auth-user-pass auth.txt/' proton.ovpn
 
           log="$RUNNER_TEMP/vpn.log"
           "$OVPN_BIN" --config proton.ovpn --log "$log" &

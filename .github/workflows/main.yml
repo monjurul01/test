@@ -44,7 +44,7 @@ on:
 
 jobs:
   automation:
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.os || 'windows-2025' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -2510,11 +2510,11 @@ jobs:
       - name: Run bot
         shell: pwsh
         env:
-          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email }}
-          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
-          HEADLESS: ${{ github.event.inputs.headless }}
-          TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
-          UA_GROUP: ${{ github.event.inputs.ua_group }}
+          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email || secrets.ZEDGE_EMAIL }}
+          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password || secrets.ZEDGE_PASSWORD }}
+          HEADLESS: ${{ github.event.inputs.headless || 'false' }}
+          TOTAL_PROFILES: ${{ github.event.inputs.total_profiles || '3' }}
+          UA_GROUP: ${{ github.event.inputs.ua_group || 'random' }}
           FOLDER_NAME: "Edward"
           FB_NOTIF_APIKEY: ${{ secrets.FB_NOTIF_APIKEY }}
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}

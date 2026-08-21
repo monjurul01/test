@@ -2486,31 +2486,50 @@ jobs:
             Write-Error "VPN_CONFIG secret is EMPTY or not set. Add it under repo Settings > Secrets and variables > Actions."
             exit 1
           }
+          Write-Host ("VPN_CONFIG length: {0} chars" -f $env:VPN_CONFIG.Length)
 
           # 2) Write config, normalizing CRLF -> LF
           $confPath = Join-Path $PWD "proton.conf"
           $cfg = $env:VPN_CONFIG -replace "`r`n", "`n"
           [System.IO.File]::WriteAllText($confPath, $cfg)
 
-          # 3) Sanity-check the structure WITHOUT printing the secret
-          $hasIface = Select-String -Path $confPath -Pattern '^\[Interface\]'   -Quiet
-          $hasPeer  = Select-String -Path $confPath -Pattern '^\[Peer\]'        -Quiet
-          $hasEnd   = Select-String -Path $confPath -Pattern '^\s*Endpoint\s*=' -Quiet
-          $lineCount = (Get-Content $confPath).Count
-          Write-Host "Config check -> [Interface]=$hasIface [Peer]=$hasPeer Endpoint=$hasEnd lines=$lineCount"
-          if (-not ($hasIface -and $hasPeer)) {
-            Write-Error "proton.conf is malformed (missing [Interface] or [Peer]). Re-copy the FULL WireGuard config into the secret."
+          # 3) Show parsed fields (secret values redacted) so a bad config is obvious
+          function Get-Field([string]$name, [string]$text) {
+            $m = [regex]::Match($text, "(?im)^\s*" + $name + "\s*=\s*(.+?)\s*$")
+            if ($m.Success) { return $m.Groups[1].Value.Trim() } else { return $null }
+          }
+          function Show-Field([string]$label, [string]$val, [bool]$secret) {
+            if ([string]::IsNullOrWhiteSpace($val)) { Write-Host "  $label = MISSING" }
+            elseif ($secret) { Write-Host "  $label = present (length $($val.Length))" }
+            else { Write-Host "  $label = $val" }
+          }
+          $cfgText = Get-Content $confPath -Raw
+          $priv = Get-Field 'PrivateKey' $cfgText
+          $pub  = Get-Field 'PublicKey'  $cfgText
+          $addr = Get-Field 'Address'    $cfgText
+          $dns  = Get-Field 'DNS'        $cfgText
+          $endp = Get-Field 'Endpoint'   $cfgText
+          $aips = Get-Field 'AllowedIPs' $cfgText
+          Write-Host "Parsed proton.conf (secrets redacted):"
+          Show-Field 'PrivateKey' $priv $true
+          Show-Field 'PublicKey'  $pub  $true
+          Show-Field 'Address'    $addr $false
+          Show-Field 'DNS'        $dns  $false
+          Show-Field 'Endpoint'   $endp $false
+          Show-Field 'AllowedIPs' $aips $false
+          if (-not $priv -or -not $endp -or -not $addr) {
+            Write-Error "proton.conf is missing PrivateKey/Address/Endpoint. Re-copy the FULL WireGuard config into the secret."
             exit 1
           }
+          if ($priv.Length -ne 44) { Write-Host "WARNING: PrivateKey length is $($priv.Length), expected 44 (base64). Key may be wrong/placeholder." }
 
           Write-Host "IP before VPN:"
           try { Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 10 } catch { Write-Host "(lookup failed)" }
 
-          # 4) Install the tunnel service, then start it with retries (up to ~30s)
+          # 4) Install tunnel service, then start with retries (~30s)
           & $wg /installtunnelservice $confPath
           "proton" | Out-File -FilePath (Join-Path $PWD "vpn.tunnel") -Encoding ascii -NoNewline
           $svcName = 'WireGuardTunnel$proton'
-
           $svc = $null
           for ($i = 1; $i -le 6; $i++) {
             Start-Sleep -Seconds 5
@@ -2527,19 +2546,45 @@ jobs:
             }
           }
 
-          # 5) Still not running? Print the REAL reason from the event logs
+          # 5) Still not running? Dump WireGuard's OWN tunnel log = the exact reason
           if (-not $svc -or $svc.Status -ne 'Running') {
-            Write-Host "=================== WireGuard did NOT start ==================="
+            Write-Host "=================== WireGuard tunnel did NOT start ==================="
+            $logPath = "C:\Program Files\WireGuard\Data\log.bin"
+            if (-not (Test-Path $logPath)) {
+              $f = Get-ChildItem "C:\Program Files\WireGuard" -Recurse -Filter 'log.bin' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($f) { $logPath = $f.FullName }
+            }
+            if (Test-Path $logPath) {
+              Write-Host "--- WireGuard tunnel log ---"
+              try {
+                $fs = [System.IO.File]::Open($logPath, 'Open', 'Read', 'ReadWrite')
+                $b = New-Object byte[] $fs.Length
+                [void]$fs.Read($b, 0, $b.Length)
+                $fs.Close()
+                $maxLines = 2048; $lineLen = 512; $rec = 520
+                $nextIndex = [BitConverter]::ToUInt32($b, 4)
+                for ($n = 0; $n -lt $maxLines; $n++) {
+                  $idx = ($nextIndex + $n) % $maxLines
+                  $off = 8 + $idx * $rec
+                  if ($off + $rec -gt $b.Length) { continue }
+                  $timeNs = [BitConverter]::ToInt64($b, $off)
+                  if ($timeNs -eq 0) { continue }
+                  $z = [Array]::IndexOf($b, [byte]0, $off + 8)
+                  $len = if ($z -ge ($off + 8) -and $z -lt ($off + 8 + $lineLen)) { $z - ($off + 8) } else { $lineLen }
+                  if ($len -le 0) { continue }
+                  $text = [System.Text.Encoding]::UTF8.GetString($b, $off + 8, $len)
+                  Write-Host "  $text"
+                }
+              } catch { Write-Host "  (could not parse log.bin: $($_.Exception.Message))" }
+            } else {
+              Write-Host "--- No log.bin found; tunnel never initialized its log ---"
+            }
             Write-Host "--- Service Control Manager (System log) ---"
-            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 60 -ErrorAction SilentlyContinue |
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 40 -ErrorAction SilentlyContinue |
               Where-Object { $_.Message -like '*proton*' -or $_.Message -like '*WireGuard*' } |
-              Select-Object -First 10 TimeCreated, Id, Message | Format-List
-            Write-Host "--- WireGuard (Application log) ---"
-            Get-WinEvent -LogName 'Application' -MaxEvents 80 -ErrorAction SilentlyContinue |
-              Where-Object { $_.ProviderName -like '*WireGuard*' -or $_.Message -like '*WireGuard*' } |
-              Select-Object -First 15 TimeCreated, Message | Format-List
-            Write-Host "=============================================================="
-            Write-Host "Most likely: empty/invalid VPN_CONFIG, wrong keys, an expired Proton config, or a blocked/unreachable Endpoint (UDP)."
+              Select-Object -First 6 TimeCreated, Id, Message | Format-List
+            Write-Host "====================================================================="
+            Write-Host "Read the tunnel log above for the exact cause (bad key, DNS/endpoint resolve, adapter creation, etc.)."
             exit 1
           }
 

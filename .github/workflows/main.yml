@@ -2521,10 +2521,27 @@ jobs:
             Write-Error "proton.conf is missing PrivateKey/Address/Endpoint. Re-copy the FULL WireGuard config into the secret."
             exit 1
           }
-          if ($priv.Length -ne 44) { Write-Host "WARNING: PrivateKey length is $($priv.Length), expected 44 (base64). Key may be wrong/placeholder." }
+          # 3b) STRICT validation: wrong config => show exact problem + CANCEL
+          $cfgErrors = @()
+          if ($priv -notmatch '^[A-Za-z0-9+/]{43}=$') { $cfgErrors += "PrivateKey INVALID: length $($priv.Length), expected a 44-char base64 WireGuard key ending with '='. You probably pasted a placeholder or partial key." }
+          if ($pub -and $pub -notmatch '^[A-Za-z0-9+/]{43}=$') { $cfgErrors += "PublicKey INVALID: length $($pub.Length), expected a 44-char base64 WireGuard key ending with '='." }
+          if ($endp -notmatch ':\d{1,5}$') { $cfgErrors += "Endpoint INVALID: '$endp' must look like host:port (e.g. 1.2.3.4:51820)." }
+          if ($addr -notmatch '^[0-9a-fA-F\.:]+(/\d{1,3})?(\s*,\s*[0-9a-fA-F\.:]+(/\d{1,3})?)*$') { $cfgErrors += "Address INVALID: '$addr' must be an IP/CIDR like 10.2.0.2/32." }
+          if (-not ($cfgText -match '(?im)^\s*\[Interface\]')) { $cfgErrors += "Config missing [Interface] section - this is not a valid WireGuard config." }
+          if (-not ($cfgText -match '(?im)^\s*\[Peer\]')) { $cfgErrors += "Config missing [Peer] section - this is not a valid WireGuard config." }
+          if ($cfgErrors.Count -gt 0) {
+            Write-Host "=================== VPN CONFIG IS WRONG ==================="
+            $cfgErrors | ForEach-Object { Write-Host "  ERROR: $_" }
+            Write-Host "Fix the VPN_CONFIG secret: copy the FULL WireGuard config file from Proton VPN (Downloads > WireGuard configuration) and paste it exactly."
+            Write-Host "==========================================================="
+            Write-Error "Invalid WireGuard config - cancelling workflow before connecting."
+            exit 1
+          }
+          Write-Host "Config validation passed."
 
-          Write-Host "IP before VPN:"
-          try { Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 10 } catch { Write-Host "(lookup failed)" }
+          $ipBefore = $null
+          try { $ipBefore = (Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 10).ToString().Trim() } catch { Write-Host "(IP lookup before VPN failed)" }
+          Write-Host "IP before VPN: $ipBefore"
 
           # 4) Install tunnel service, then start with retries (~30s)
           & $wg /installtunnelservice $confPath
@@ -2585,11 +2602,47 @@ jobs:
               Select-Object -First 6 TimeCreated, Id, Message | Format-List
             Write-Host "====================================================================="
             Write-Host "Read the tunnel log above for the exact cause (bad key, DNS/endpoint resolve, adapter creation, etc.)."
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "WireGuard tunnel failed to start - cancelling workflow."
             exit 1
           }
 
-          Write-Host "IP after VPN:"
-          try { Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 10 } catch { Write-Host "(lookup failed)" }
+          # 6) VERIFY the VPN is really working: IP must change
+          $ipAfter = $null
+          $ipInfo = $null
+          for ($i = 1; $i -le 5; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 10
+              $ipAfter = $ipInfo.ip.ToString().Trim()
+              if ($ipAfter) { break }
+            } catch { Write-Host "IP check attempt $i failed, retrying..." }
+          }
+          if ([string]::IsNullOrWhiteSpace($ipAfter)) {
+            Write-Host "=================== VPN VERIFICATION FAILED ==================="
+            Write-Host "Tunnel service is running but no internet through VPN (IP lookup failed 5 times)."
+            Write-Host "Likely causes: wrong PrivateKey (handshake fails silently), dead Endpoint, or DNS issue."
+            Write-Host "==============================================================="
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "No connectivity through VPN - cancelling workflow."
+            exit 1
+          }
+          if ($ipBefore -and ($ipAfter -eq $ipBefore)) {
+            Write-Host "=================== VPN VERIFICATION FAILED ==================="
+            Write-Host "IP did NOT change (before: $ipBefore, after: $ipAfter). Traffic is NOT going through the VPN."
+            Write-Host "Likely causes: wrong AllowedIPs (should be 0.0.0.0/0), or handshake failed due to a bad key."
+            Write-Host "==============================================================="
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "VPN not routing traffic - cancelling workflow."
+            exit 1
+          }
+          Write-Host "==================== VPN CONNECTED OK ===================="
+          Write-Host ("Connected IP : {0}" -f $ipAfter)
+          if ($ipInfo) {
+            Write-Host ("Location     : {0}, {1} ({2})" -f $ipInfo.city, $ipInfo.region, $ipInfo.country)
+            Write-Host ("Provider     : {0}" -f $ipInfo.org)
+          }
+          Write-Host "==========================================================="
           Write-Host "WireGuard connected successfully"
         env:
           VPN_CONFIG: ${{ secrets.VPN_CONFIG }}

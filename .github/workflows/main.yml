@@ -2505,10 +2505,17 @@ jobs:
                   await page.waitForTimeout(1000);
                   await autoKillConsent(page);
 
-                  await safeClick(
-                    page.locator("svg.fa-plus").first(),
-                    "Upload plus icon"
-                  );
+                  if (queueItem.is24h) {
+                    await safeClick(
+                      page.locator("svg.fa-ellipsis-h, svg[data-icon='ellipsis-h']").first(),
+                      "Upload ellipsis icon (24H)"
+                    );
+                  } else {
+                    await safeClick(
+                      page.locator("svg.fa-plus").first(),
+                      "Upload plus icon"
+                    );
+                  }
 
                   await page.waitForTimeout(800);
                   await autoKillConsent(page);
@@ -2523,20 +2530,19 @@ jobs:
                     // on each Zedge deploy, so match by the stable link text instead.)
                     const menuSelectors24 = [
                       'text="24H Wallpaper"',
-                      'div:has-text("24H Wallpaper")',
-                      'span:has-text("24H Wallpaper")',
-                      'a:has-text("24H Wallpaper")',
-                      'a:has-text("24H")',
-                      '[role="menuitem"]:has-text("24H")',
-                      'button:has-text("24H")',
-                      'li:has-text("24H")',
-                      'a:has-text("24-Hour")'
+                      'text="24H"',
+                      'text="Wallpaper that changes based on time"',
+                      'button:has-text("24H Wallpaper")',
+                      'div[role="button"]:has-text("24H Wallpaper")'
                     ];
                     for (const sel24 of menuSelectors24) {
                       try {
-                        const el24 = page.locator(sel24).first();
+                        // Playwright's 'text=' selector automatically targets the deepest matching element.
+                        // For xpath/css that might match parent containers, we should use .last() to get the deepest node.
+                        const el24 = sel24.startsWith('text=') ? page.locator(sel24).first() : page.locator(sel24).last();
                         if (await el24.isVisible({ timeout: 4000 })) {
-                          await el24.click();
+                          // force: true helps if there's a slight overlay or animation issue
+                          await el24.click({ force: true });
                           console.log(`Clicked 24-Hour option via: ${sel24}`);
                           clicked24 = true;
                           break;

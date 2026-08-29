@@ -2522,16 +2522,15 @@ jobs:
                     // (sc-* classes are auto-generated styled-components hashes that change
                     // on each Zedge deploy, so match by the stable link text instead.)
                     const menuSelectors24 = [
+                      'text="24H Wallpaper"',
+                      'div:has-text("24H Wallpaper")',
+                      'span:has-text("24H Wallpaper")',
                       'a:has-text("24H Wallpaper")',
                       'a:has-text("24H")',
                       '[role="menuitem"]:has-text("24H")',
                       'button:has-text("24H")',
                       'li:has-text("24H")',
-                      'a:has-text("24-Hour")',
-                      'a:has-text("24 Hour")',
-                      'button:has-text("24-Hour")',
-                      'button:has-text("24 Hour")',
-                      '[role="menuitem"]:has-text("24")'
+                      'a:has-text("24-Hour")'
                     ];
                     for (const sel24 of menuSelectors24) {
                       try {

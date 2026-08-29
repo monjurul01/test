@@ -318,7 +318,7 @@ jobs:
             }
             try {
               const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(message)}`;
-              const res = await fetch(url);
+              const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
               if (!res.ok) {
                 console.log(`Facebook API response failed: HTTP ${res.status}`);
               } else {
@@ -326,6 +326,81 @@ jobs:
               }
             } catch (err) {
               console.log(`Error sending Facebook notification: ${err.message}`);
+            }
+          }
+
+          async function sendTelegramMessage(message) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) return false;
+            try {
+              const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, text: message }),
+                signal: AbortSignal.timeout(15000)
+              });
+              if (!res.ok) {
+                console.log(`Telegram API response failed: HTTP ${res.status}`);
+                return false;
+              }
+              console.log("Telegram notification successfully sent.");
+              return true;
+            } catch (err) {
+              console.log(`Error sending Telegram notification: ${err.message}`);
+              return false;
+            }
+          }
+
+          // Telegram Bot API can send the actual video file directly (up to 50 MB)
+          async function sendTelegramVideo(videoBuffer, fileName, caption) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) return false;
+            try {
+              const mime = fileName.toLowerCase().endsWith(".mp4") ? "video/mp4" : "video/webm";
+              const form = new FormData();
+              form.append("chat_id", chatId);
+              form.append("caption", caption);
+              form.append("video", new Blob([videoBuffer], { type: mime }), fileName);
+              const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
+                method: "POST",
+                body: form,
+                signal: AbortSignal.timeout(120000)
+              });
+              if (!res.ok) {
+                const errBody = await res.text().catch(() => "");
+                console.log(`Telegram sendVideo failed: HTTP ${res.status} ${errBody} — retrying as document...`);
+                const form2 = new FormData();
+                form2.append("chat_id", chatId);
+                form2.append("caption", caption);
+                form2.append("document", new Blob([videoBuffer], { type: mime }), fileName);
+                const res2 = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+                  method: "POST",
+                  body: form2,
+                  signal: AbortSignal.timeout(120000)
+                });
+                if (!res2.ok) {
+                  const errBody2 = await res2.text().catch(() => "");
+                  console.log(`Telegram sendDocument also failed: HTTP ${res2.status} ${errBody2}`);
+                  return false;
+                }
+                console.log("Telegram video sent as document file.");
+                return true;
+              }
+              console.log("Telegram video successfully sent.");
+              return true;
+            } catch (err) {
+              console.log(`Error sending Telegram video: ${err.message}`);
+              return false;
+            }
+          }
+
+          // Prefer Telegram; fall back to Facebook (CallMeBot) if Telegram is not configured or fails
+          async function sendNotification(message) {
+            const sentViaTelegram = await sendTelegramMessage(message);
+            if (!sentViaTelegram) {
+              await sendFacebookNotification(message);
             }
           }
 
@@ -402,7 +477,8 @@ jobs:
               totalUploadsToday: state.totalUploadsToday + 1,
               lastUsedProfileIndex: usedProfileIndex,
               totalProfilesAvailable: state.totalProfilesAvailable,
-              profileUploadCounts
+              profileUploadCounts,
+              uploadDayType: getDayTypeToday() === "ringtone" ? "AUDIO" : "WALLPAPER"
             });
           }
 
@@ -423,6 +499,18 @@ jobs:
             console.log("Checking Firebase Realtime Database queue...");
             const data = await firebaseGet(queuePath);
             if (!data) throw new Error("No items found in Realtime Database");
+
+            // Stale "processing" recovery: if a previous run crashed mid-upload,
+            // the item stays stuck in "processing" forever and no run ever picks it up again.
+            // Reset anything processing for over 30 minutes back to "queued".
+            const STALE_PROCESSING_MS = 30 * 60 * 1000;
+            for (const [staleId, staleItem] of Object.entries(data)) {
+              if (staleItem && staleItem.status === "processing" && (Date.now() - (staleItem.processingAt || 0)) > STALE_PROCESSING_MS) {
+                console.log(`♻️ Resetting stale processing item back to queued: ${staleItem.name || staleId}`);
+                await firebasePatch(`${queuePath}/${staleId}`, { status: "queued", processingAt: null });
+                staleItem.status = "queued";
+              }
+            }
 
             const dayType = getDayTypeToday();
             console.log(`Today is Day type: ${dayType || "any (no schedule set)"}`);
@@ -486,6 +574,26 @@ jobs:
               fs.writeFileSync(localFile, Buffer.from(base64, "base64"));
             }
 
+            // ── 24-Hour wallpaper set: download all four time-of-day frames ──
+            const is24h = !!item.is24h && item.fileUrls && typeof item.fileUrls === "object";
+            const localFiles = [];
+            const allUrls = [];
+            if (is24h) {
+              const slotOrder = ["morning", "afternoon", "evening", "night"];
+              for (const slot of slotOrder) {
+                const slotUrl = item.fileUrls[slot];
+                if (!slotUrl) throw new Error(`24H item is missing the ${slot} image`);
+                const slotFile = path.join(localDir, `${id}_${slot}.jpg`);
+                console.log(`Downloading 24H ${slot} frame: ${slotUrl}`);
+                const slotRes = await fetch(slotUrl);
+                if (!slotRes.ok) throw new Error(`24H ${slot} frame download failed: HTTP ${slotRes.status}`);
+                fs.writeFileSync(slotFile, Buffer.from(await slotRes.arrayBuffer()));
+                localFiles.push(slotFile);
+                allUrls.push(slotUrl);
+              }
+              console.log(`24H set ready: ${localFiles.length} frames downloaded`);
+            }
+
             await firebasePatch(`${queuePath}/${id}`, {
               status: "processing",
               processingAt: Date.now()
@@ -495,6 +603,9 @@ jobs:
               id,
               localFile,
               isMp3,
+              is24h,
+              localFiles,
+              allUrls,
               imageUrl: item.imageUrl || item.fileUrl || "",
               name:        item.name || id,
               title:       item.title || "",
@@ -690,6 +801,47 @@ jobs:
             console.log(`${label} confirmed checked`);
           }
 
+          // Zedge wallpaper requirements: JPEG only, max 8 MB, min 1620x2880 px, max 25M px total
+          function getImageInfo(buf) {
+            if (buf[0] === 0xff && buf[1] === 0xd8) {
+              let i = 2;
+              while (i < buf.length - 9) {
+                if (buf[i] !== 0xff) { i++; continue; }
+                const marker = buf[i + 1];
+                if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+                  return { format: "jpeg", height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+                }
+                i += 2 + buf.readUInt16BE(i + 2);
+              }
+              return { format: "jpeg", width: 0, height: 0 };
+            }
+            if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+              return { format: "png", width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+            }
+            return { format: "unknown", width: 0, height: 0 };
+          }
+
+          function validateWallpaperFile(localFile) {
+            const buf = require("fs").readFileSync(localFile);
+            const sizeMb = buf.length / (1024 * 1024);
+            const info = getImageInfo(buf);
+            console.log(`File check: format=${info.format}, ${info.width}x${info.height}, ${sizeMb.toFixed(2)} MB`);
+            if (info.format !== "jpeg") {
+              throw new Error(`Zedge only accepts JPEG - this file is actually ${info.format.toUpperCase()} (renaming to .jpg does not convert it)`);
+            }
+            if (sizeMb > 8) {
+              throw new Error(`File too big for Zedge: ${sizeMb.toFixed(2)} MB (max 8 MB)`);
+            }
+            if (info.width && info.height) {
+              if (info.width < 1620 || info.height < 2880) {
+                throw new Error(`Image too small for Zedge: ${info.width}x${info.height} px (minimum 1620x2880)`);
+              }
+              if (info.width * info.height > 25000000) {
+                throw new Error(`Image has too many pixels: ${info.width}x${info.height} (max 25M px total)`);
+              }
+            }
+          }
+
           async function uploadWallpaperInDialog(page, localFile) {
             console.log("Waiting for Upload dialog (with file input inside)");
 
@@ -726,10 +878,15 @@ jobs:
             console.log("Uploading file");
             await fileInput.setInputFiles(localFile);
 
-            await page.waitForFunction(() => {
-              const input = document.querySelector('input[data-hook="form-field-files-input"]');
-              return input && input.files && input.files.length > 0;
-            });
+            try {
+              await page.waitForFunction(() => {
+                const input = document.querySelector('input[data-hook="form-field-files-input"]');
+                return input && input.files && input.files.length > 0;
+              }, null, { timeout: 20000 });
+            } catch (e) {
+              await page.screenshot({ path: "zedge-file-rejected.png", fullPage: true }).catch(() => {});
+              throw new Error("File did not attach within 20s - Zedge likely rejected it (JPEG only, max 8 MB, min 1620x2880 px). Check zedge-file-rejected.png");
+            }
 
             console.log("Waiting for Upload button to become enabled");
             const uploadButton = dialog
@@ -739,11 +896,20 @@ jobs:
             await uploadButton.waitFor({ state: "visible" });
             await scrollToElement(uploadButton);
 
-            await page.waitForFunction(() => {
-              const buttons = [...document.querySelectorAll('button[type="submit"]')];
-              const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
-              return upload && upload.disabled === false;
-            });
+            try {
+              await page.waitForFunction(() => {
+                const buttons = [...document.querySelectorAll('button[type="submit"]')];
+                const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
+                return upload && upload.disabled === false;
+              }, null, { timeout: 30000 });
+            } catch (e) {
+              const dialogText = await page.evaluate(() => {
+                const dlg = document.querySelector('[role="dialog"]');
+                return dlg ? dlg.innerText.slice(0, 300) : "";
+              }).catch(() => "");
+              await page.screenshot({ path: "zedge-upload-btn-stuck.png", fullPage: true }).catch(() => {});
+              throw new Error(`Upload button never became enabled - Zedge rejected the file. Dialog: ${dialogText || "see zedge-upload-btn-stuck.png"}`);
+            }
 
             await uploadButton.click();
 
@@ -2348,7 +2514,53 @@ jobs:
                   await autoKillConsent(page);
                   await page.screenshot({ path: `zedge-upload-menu-${uploadNum}.png`, fullPage: false });
 
-                  await uploadWallpaperInDialog(page, queueItem.localFile);
+                  if (queueItem.is24h) {
+                    console.log("Selecting 24-Hour Wallpaper upload type from menu...");
+                    let clicked24 = false;
+                    // Confirmed from Zedge's live upload menu DOM:
+                    // <div class="sc-hAZoDl iMIILv"><a class="sc-bhVIhj gabylK">24H Wallpaper</a></div>
+                    // (sc-* classes are auto-generated styled-components hashes that change
+                    // on each Zedge deploy, so match by the stable link text instead.)
+                    const menuSelectors24 = [
+                      'a:has-text("24H Wallpaper")',
+                      'a:has-text("24H")',
+                      '[role="menuitem"]:has-text("24H")',
+                      'button:has-text("24H")',
+                      'li:has-text("24H")',
+                      'a:has-text("24-Hour")',
+                      'a:has-text("24 Hour")',
+                      'button:has-text("24-Hour")',
+                      'button:has-text("24 Hour")',
+                      '[role="menuitem"]:has-text("24")'
+                    ];
+                    for (const sel24 of menuSelectors24) {
+                      try {
+                        const el24 = page.locator(sel24).first();
+                        if (await el24.isVisible({ timeout: 4000 })) {
+                          await el24.click();
+                          console.log(`Clicked 24-Hour option via: ${sel24}`);
+                          clicked24 = true;
+                          break;
+                        }
+                      } catch (e) { }
+                    }
+                    if (!clicked24) {
+                      console.log("⚠️ 24-Hour menu option not found — continuing, the dialog may already be open. Check zedge-24h-menu screenshot.");
+                    }
+                    await page.waitForTimeout(800);
+                    await autoKillConsent(page);
+                    await page.screenshot({ path: `zedge-24h-menu-${uploadNum}.png`, fullPage: false }).catch(() => {});
+                  }
+
+                  if (!queueItem.isMp3) {
+                    if (queueItem.is24h && queueItem.localFiles && queueItem.localFiles.length === 4) {
+                      queueItem.localFiles.forEach(validateWallpaperFile);
+                    } else {
+                      validateWallpaperFile(queueItem.localFile);
+                    }
+                  }
+
+                  await uploadWallpaperInDialog(page, queueItem.is24h ? queueItem.localFiles : queueItem.localFile);
 
                   await fillMetaDialog(page, {
                     title:       queueItem.title,
@@ -2363,7 +2575,12 @@ jobs:
 
                   await page.screenshot({ path: `zedge-final-${uploadNum}.png`, fullPage: true });
 
-                  const uploadedType = queueItem.isMp3 ? "ringtone" : "wallpaper";
+                  const uploadedType = queueItem.is24h ? "24h-wallpaper" : (queueItem.isMp3 ? "ringtone" : "wallpaper");
+                  if (queueItem.is24h && Array.isArray(queueItem.allUrls)) {
+                    for (const extraUrl of queueItem.allUrls) {
+                      if (extraUrl && extraUrl !== queueItem.imageUrl) await deleteFromR2(extraUrl).catch(() => {});
+                    }
+                  }
                   await markWallpaperDoneAndDelete(queueItem.id, queueItem.name, uploadedType, queueItem.imageUrl);
                   await updateProfileStateAfterUpload(currentState, currentProfileIndex);
 
@@ -2379,21 +2596,25 @@ jobs:
                   successCount++;
 
                   const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
+                  const dayLabel = getDayTypeToday() === "ringtone" ? "🎵 Ringtone Day" : "🖼️ Wallpaper Day";
+                  const dhakaTime = new Date().toLocaleString("en-GB", { timeZone: "Asia/Dhaka", hour12: true });
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `⚠️ [${folderLabel}] Zedge Upload Alert!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}\n\nNotice: This item has been auto-removed from Zedge.`;
+                    notifyMsg = `⚠️ [${folderLabel}] Zedge Upload Alert!\n\n📅 ${dayLabel}\n🕐 ${dhakaTime} (Dhaka)\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}\n📊 Today: ${currentState.totalUploadsToday}/${ZEDGE_DAILY_LIMIT} uploads\n\nNotice: This item has been auto-removed from Zedge.`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `🚀 [${folderLabel}] Zedge Upload Success!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}`;
+                    notifyMsg = `🚀 [${folderLabel}] Zedge Upload Success!\n\n📅 ${dayLabel}\n🕐 ${dhakaTime} (Dhaka)\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}\n📊 Today: ${currentState.totalUploadsToday}/${ZEDGE_DAILY_LIMIT} uploads`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
-                  await sendFacebookNotification(notifyMsg);
+                  await sendNotification(notifyMsg);
 
                 } catch (uploadErr) {
                   console.error(`❌ Upload ${uploadNum} failed with a technical error: ${uploadErr.message}`);
                   if (queueItem?.id) {
                     await markWallpaperFailed(queueItem.id, uploadErr.message).catch(() => {});
                   }
+                  const failLabel = process.env.FOLDER_NAME || "Zedge Bot";
+                  await sendNotification(`❌ [${failLabel}] Zedge Upload Failed!\n\nFile: ${queueItem?.name || "unknown"}\nReason: ${String(uploadErr.message).slice(0, 300)}`).catch(() => {});
                   await page.screenshot({ path: `zedge-error-upload-${uploadNum}.png`, fullPage: true }).catch(() => {});
                   console.log("Continuing to next upload despite error...");
                 }
@@ -2434,14 +2655,35 @@ jobs:
                   } else {
                     vfiles.sort((a, b) => vfs.statSync(vpath.join(vdir, b)).size - vfs.statSync(vpath.join(vdir, a)).size);
                     const vfile = vpath.join(vdir, vfiles[0]);
-                    const vbuf = vfs.readFileSync(vfile);
+
+                    // Telegram sendVideo only reliably accepts MP4 — convert webm -> mp4 with ffmpeg
+                    // (ffmpeg is preinstalled on GitHub ubuntu runners)
+                    let vsendFile = vfile;
+                    let vext = ".webm";
+                    let vmime = "video/webm";
+                    try {
+                      const { execSync } = require("child_process");
+                      const vmp4 = vfile.replace(/\.webm$/i, ".mp4");
+                      console.log("Converting session video webm -> mp4 with ffmpeg...");
+                      execSync(`ffmpeg -y -loglevel error -i "${vfile}" -c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p -movflags +faststart -an "${vmp4}"`, { stdio: "inherit", timeout: 180000 });
+                      if (vfs.existsSync(vmp4) && vfs.statSync(vmp4).size > 0) {
+                        vsendFile = vmp4;
+                        vext = ".mp4";
+                        vmime = "video/mp4";
+                        console.log("ffmpeg conversion OK — sending MP4");
+                      }
+                    } catch (convErr) {
+                      console.log(`ffmpeg conversion failed (${convErr.message}) — using original webm`);
+                    }
+
+                    const vbuf = vfs.readFileSync(vsendFile);
                     const vsizeMb = (vbuf.length / (1024 * 1024)).toFixed(1);
                     const vstamp = new Date().toISOString().replace(/[:.]/g, "-");
-                    const vkey = `zedge-video-${vstamp}.webm`;
+                    const vkey = `zedge-video-${vstamp}${vext}`;
                     console.log(`Uploading session video (${vsizeMb} MB) to R2...`);
                     const vres = await fetch(workerUrl, {
                       method: "POST",
-                      headers: { "X-File-Name": vkey, "X-File-Type": "video/webm" },
+                      headers: { "X-File-Name": vkey, "X-File-Type": vmime },
                       body: vbuf
                     });
                     if (!vres.ok) {
@@ -2454,7 +2696,20 @@ jobs:
                       } else {
                         console.log(`Session video uploaded: ${vurl}`);
                         const vlabel = process.env.FOLDER_NAME || "Zedge Bot";
-                        await sendFacebookNotification(`🎥 [${vlabel}] Session Video Ready!\n\nUploads this run: ${successCount}\nSize: ${vsizeMb} MB\n\nWatch: ${vurl}`);
+                        const vday = getDayTypeToday() === "ringtone" ? "🎵 Ringtone Day" : "🖼️ Wallpaper Day";
+                        // No link in the caption — only the actual MP4 video is sent
+                        const vcaption = `🎥 [${vlabel}] Session Video\n\n📅 ${vday}\nUploads this run: ${successCount}\nSize: ${vsizeMb} MB`;
+                        // Try sending the actual video file via Telegram (50 MB API limit, keep 45 MB safety margin)
+                        let videoSent = false;
+                        if (parseFloat(vsizeMb) <= 45) {
+                          videoSent = await sendTelegramVideo(vbuf, vkey, vcaption);
+                        } else {
+                          console.log(`Video too large for Telegram (${vsizeMb} MB > 45 MB) — sending link instead`);
+                        }
+                        // Last resort only: if the video file itself could not be sent, fall back to the link so the recording is not lost
+                        if (!videoSent) {
+                          await sendNotification(`${vcaption}\n\n(Video file could not be sent — watch here: ${vurl})`);
+                        }
                       }
                     }
                   }
@@ -2657,6 +2912,8 @@ jobs:
           UA_GROUP: ${{ github.event.inputs.ua_group || 'random' }}
           FOLDER_NAME: "Edward"
           FB_NOTIF_APIKEY: ${{ secrets.FB_NOTIF_APIKEY }}
+          TELEGRAM_BOT_TOKEN: "8875181350:AAFay-L86o3ON-9CpEFrEnnBXJrLap6QU_Q"
+          TELEGRAM_CHAT_ID: "6733643531"
           FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
           SCHEDULE_START: "1781913600000"
           R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
@@ -2671,6 +2928,7 @@ jobs:
             zedge-before-login.png
             zedge-after-login.png
             zedge-upload-menu-*.png
+            zedge-24h-menu-*.png
             zedge-after-type-click-*.png
             zedge-dialog-error.png
             zedge-error-upload-*.png

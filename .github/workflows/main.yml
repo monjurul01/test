@@ -1,0 +1,2872 @@
+name: Zedge Safe Automation (WireGuard VPN) + Realtime DB Wallpaper & Ringtone
+
+on:
+  workflow_dispatch:
+    inputs:
+      zedge_email:
+        description: "Zedge email"
+        required: true
+      zedge_password:
+        description: "Zedge password"
+        required: true
+      headless:
+        description: "Run headless? true/false"
+        required: true
+        default: "false"
+      total_profiles:
+        description: "Number of Zedge profiles to rotate through (e.g. 1, 2, 3, 6)"
+        required: false
+        default: "3"
+      force_run:
+        description: "Skip random time gate and upload immediately? true/false"
+        required: false
+        default: "false"
+      os:
+        description: "🖥️ Runner OS"
+        required: true
+        default: "windows-2025"
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+          - windows-latest
+      ua_group:
+        description: "🌐 Browser / User-Agent type"
+        required: true
+        default: "random"
+        type: choice
+        options:
+          - random
+          - chrome_windows
+          - edge_windows
+          - firefox
+          - chrome_macos
+          - safari_macos
+          - android_mobile
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+    steps:
+      - name: Random time slot gate (daily-changing random upload time)
+        id: decide
+        shell: bash
+        run: |
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "go=yes" >> "$GITHUB_OUTPUT"
+            echo "Force run enabled - skipping random gate."
+            exit 0
+          fi
+          node -e "
+            const WINDOWS = [10, 15, 20];          // window start hours (Asia/Dhaka)
+            const WINDOW_HOURS = 3;                 // each window lasts 3 hours
+            const SLOT_MIN = 30;                    // scheduler triggers every 30 min
+            const now = new Date(Date.now() + 6 * 3600 * 1000); // UTC+6 Dhaka
+            const h = now.getUTCHours(), m = now.getUTCMinutes();
+            const dateKey = now.toISOString().slice(0, 10);
+            const wIdx = WINDOWS.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+            if (wIdx < 0) { console.log('Outside upload windows - skip.'); process.exit(2); }
+            const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+            const minsIn = (h - WINDOWS[wIdx]) * 60 + m;
+            const curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+            let hash = 0;
+            const seed = dateKey + '#' + wIdx + '#ZEDGE1';
+            for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+            const chosen = hash % slotsPerWindow;
+            console.log('Date ' + dateKey + ' | window ' + wIdx + ' | chosen slot ' + chosen + ' | current slot ' + curSlot);
+            process.exit(curSlot === chosen ? 0 : 2);
+          " && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
+
+  automation:
+    needs: gate
+    if: needs.gate.outputs.go == 'yes'
+    runs-on: ${{ inputs.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Random minute-level delay (human-like timing)
+        if: inputs.force_run != 'true'
+        shell: bash
+        run: |
+          DELAY=$((RANDOM % 840))
+          echo "Sleeping extra ${DELAY}s for human-like random timing..."
+          sleep $DELAY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        shell: pwsh
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium
+
+      - name: 🎲 Randomize Machine Identity
+        shell: pwsh
+        run: |
+          Write-Host "============================================================"
+          Write-Host "  🎲  RANDOMIZING MACHINE IDENTITY"
+          Write-Host "============================================================"
+
+          # ── 1. Randomize Machine GUID (Windows Registry) ──────────────
+          Write-Host ""
+          Write-Host "── Machine GUID ─────────────────────────────────────────────"
+          try {
+            $oldGuid = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
+            Write-Host "Old GUID : $oldGuid"
+            $newGuid = [System.Guid]::NewGuid().ToString()
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid' -Value $newGuid
+            $verify = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
+            Write-Host "New GUID : $verify"
+            Write-Host "✅ Machine GUID randomized successfully"
+          } catch {
+            Write-Host "⚠️ Machine GUID change failed: $($_.Exception.Message)"
+          }
+
+          # ── 2. Randomize MachineId in SQM (telemetry GUID) ───────────
+          Write-Host ""
+          Write-Host "── SQM / Telemetry GUID ─────────────────────────────────────"
+          try {
+            $sqmPath = 'HKLM:\SOFTWARE\Microsoft\SQMClient'
+            if (Test-Path $sqmPath) {
+              $newSqm = [System.Guid]::NewGuid().ToString().ToUpper()
+              $newSqm = "{$newSqm}"
+              Set-ItemProperty -Path $sqmPath -Name 'MachineId' -Value $newSqm -ErrorAction SilentlyContinue
+              Write-Host "✅ SQM MachineId set to: $newSqm"
+            } else {
+              Write-Host "ℹ️ SQM registry key not present — skipping"
+            }
+          } catch {
+            Write-Host "⚠️ SQM GUID change failed: $($_.Exception.Message)"
+          }
+
+          # ── 3. Randomize MAC addresses on physical adapters ───────────
+          Write-Host ""
+          Write-Host "── MAC Address Randomization ────────────────────────────────"
+          # NOTE: We write to registry only — NO Disable/Enable adapter.
+          # Disabling the adapter would cut the runner's own GitHub connection (hangs).
+          # The registry value persists and takes effect on next adapter cycle.
+          # Websites cannot read MAC addresses via JavaScript so this is sufficient.
+          $regBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+          $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Status -ne "Not Present" }
+
+          if ($adapters) {
+            foreach ($adapter in $adapters) {
+              try {
+                # Generate locally-administered unicast MAC
+                $bytes = 1..6 | ForEach-Object { Get-Random -Minimum 0 -Maximum 255 }
+                $bytes[0] = ($bytes[0] -band 0xFE) -bor 0x02  # unicast + locally administered
+                $macReg     = ($bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ''
+                $macDisplay = ($bytes | ForEach-Object { '{0:X2}' -f $_ }) -join '-'
+
+                # Find registry subkey for this adapter by matching InterfaceGuid
+                $keys = Get-ChildItem $regBase -ErrorAction SilentlyContinue
+                $found = $false
+                foreach ($key in $keys) {
+                  $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                  if ($props.NetCfgInstanceId -and $props.NetCfgInstanceId -eq $adapter.InterfaceGuid) {
+                    # Write registry only — no disable/enable to avoid hanging
+                    Set-ItemProperty -Path $key.PSPath -Name 'NetworkAddress' -Value $macReg -ErrorAction Stop
+                    Write-Host "✅ $($adapter.Name): MAC registry → $macDisplay (active on next cycle)"
+                    $found = $true
+                    break
+                  }
+                }
+                if (-not $found) {
+                  # Fallback: try writing via netsh (no disconnect risk)
+                  Write-Host "ℹ️ Registry key not found for $($adapter.Name) — trying netsh"
+                  $netshMac = $macDisplay.Replace('-', '')
+                  netsh interface set interface "$($adapter.Name)" newmac="$netshMac" 2>$null
+                  Write-Host "✅ $($adapter.Name): netsh MAC set → $macDisplay"
+                }
+              } catch {
+                Write-Host "⚠️ MAC update skipped for $($adapter.Name): $($_.Exception.Message)"
+              }
+            }
+          } else {
+            Write-Host "ℹ️ No physical adapters found — skipping"
+          }
+
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "  ✅  Machine Identity Randomization Complete"
+          Write-Host "============================================================"
+
+      - name: Collect Device Info
+        shell: pwsh
+        run: |
+          Write-Host "============================================================"
+          Write-Host "  🖥️  GITHUB ACTIONS RUNNER — DEVICE INFORMATION REPORT"
+          Write-Host "============================================================"
+
+          # ── OS & Runner ──────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── OS & Runner ──────────────────────────────────────────────"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS Name        : $($os.Caption)"
+          Write-Host "OS Version     : $($os.Version)"
+          Write-Host "Build Number   : $($os.BuildNumber)"
+          Write-Host "Architecture   : $($os.OSArchitecture)"
+          Write-Host "System Drive   : $($os.SystemDrive)"
+          Write-Host "Install Date   : $($os.InstallDate)"
+          Write-Host "Last Boot      : $($os.LastBootUpTime)"
+          Write-Host "Runner Image   : $env:ImageOS / $env:ImageVersion"
+          Write-Host "GitHub Runner  : $env:RUNNER_NAME ($env:RUNNER_OS)"
+          Write-Host "Runner Arch    : $env:RUNNER_ARCH"
+          Write-Host "Runner Temp    : $env:RUNNER_TEMP"
+          Write-Host "Runner Tool    : $env:RUNNER_TOOL_CACHE"
+          Write-Host "GitHub Region  : $env:GITHUB_SERVER_URL"
+          Write-Host "Workflow       : $env:GITHUB_WORKFLOW"
+          Write-Host "Run ID         : $env:GITHUB_RUN_ID"
+          Write-Host "Run Number     : $env:GITHUB_RUN_NUMBER"
+          Write-Host "Job            : $env:GITHUB_JOB"
+          Write-Host "Actor          : $env:GITHUB_ACTOR"
+
+          # ── Machine / Computer Identity ───────────────────────────────
+          Write-Host ""
+          Write-Host "── Machine Identity ─────────────────────────────────────────"
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host "Computer Name  : $($cs.Name)"
+          Write-Host "Domain / WG    : $($cs.Domain)"
+          Write-Host "Manufacturer   : $($cs.Manufacturer)"
+          Write-Host "Model          : $($cs.Model)"
+          Write-Host "System Type    : $($cs.SystemType)"
+          Write-Host "Total RAM (GB) : $([math]::Round($cs.TotalPhysicalMemory / 1GB, 2))"
+
+          # Machine GUID / Machine ID (Windows Registry)
+          try {
+            $machineGuid = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
+            Write-Host "Machine GUID   : $machineGuid"
+          } catch {
+            Write-Host "Machine GUID   : (unavailable)"
+          }
+
+          # BIOS / Motherboard Serial
+          $bios = Get-CimInstance Win32_BIOS
+          Write-Host "BIOS Vendor    : $($bios.Manufacturer)"
+          Write-Host "BIOS Version   : $($bios.SMBIOSBIOSVersion)"
+          Write-Host "BIOS Serial    : $($bios.SerialNumber)"
+          Write-Host "BIOS Release   : $($bios.ReleaseDate)"
+
+          $board = Get-CimInstance Win32_BaseBoard
+          Write-Host "Motherboard    : $($board.Manufacturer) — $($board.Product)"
+          Write-Host "Board Serial   : $($board.SerialNumber)"
+
+          # ── CPU ───────────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── CPU ──────────────────────────────────────────────────────"
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "CPU Name       : $($cpu.Name)"
+          Write-Host "CPU Cores      : $($cpu.NumberOfCores)"
+          Write-Host "Logical CPUs   : $($cpu.NumberOfLogicalProcessors)"
+          Write-Host "Max Clock(MHz) : $($cpu.MaxClockSpeed)"
+          Write-Host "CPU ID         : $($cpu.ProcessorId)"
+          Write-Host "CPU Socket     : $($cpu.SocketDesignation)"
+          Write-Host "CPU Arch       : $($cpu.Architecture)"
+
+          # ── RAM Slots ─────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── RAM ──────────────────────────────────────────────────────"
+          Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+            Write-Host ("  Slot {0,-6}: {1} GB  {2} MHz  SN={3}" -f $_.DeviceLocator, [math]::Round($_.Capacity/1GB,1), $_.Speed, $_.SerialNumber)
+          }
+
+          # ── Network / MAC Addresses ───────────────────────────────────
+          Write-Host ""
+          Write-Host "── Network Adapters & MAC Addresses ─────────────────────────"
+          Get-CimInstance Win32_NetworkAdapterConfiguration |
+            Where-Object { $_.MACAddress -ne $null } |
+            ForEach-Object {
+              Write-Host ("  [{0}] MAC={1}  IP={2}  DHCP={3}" -f $_.Description, $_.MACAddress, ($_.IPAddress -join ', '), $_.DHCPEnabled)
+            }
+
+          # Quick public-IP lookup
+          Write-Host ""
+          Write-Host "── Public IP (via ipinfo.io) ─────────────────────────────────"
+          try {
+            $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 10
+            Write-Host "Public IP      : $($ipInfo.ip)"
+            Write-Host "ISP / Org      : $($ipInfo.org)"
+            Write-Host "City / Region  : $($ipInfo.city), $($ipInfo.region)"
+            Write-Host "Country        : $($ipInfo.country)"
+            Write-Host "Timezone       : $($ipInfo.timezone)"
+          } catch {
+            Write-Host "Public IP      : (lookup failed)"
+          }
+
+          # ── Disk ──────────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── Disk Drives ──────────────────────────────────────────────"
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+            $used = if ($_.Used) { [math]::Round($_.Used/1GB, 2) } else { "N/A" }
+            $free = if ($_.Free) { [math]::Round($_.Free/1GB, 2) } else { "N/A" }
+            Write-Host ("  Drive {0}: Used={1} GB  Free={2} GB" -f $_.Name, $used, $free)
+          }
+
+          # Physical disks
+          Get-CimInstance Win32_DiskDrive | ForEach-Object {
+            Write-Host ("  Physical: {0}  Size={1} GB  Serial={2}  Interface={3}" -f $_.Model, [math]::Round($_.Size/1GB,1), $_.SerialNumber, $_.InterfaceType)
+          }
+
+          # ── Environment Summary ───────────────────────────────────────
+          Write-Host ""
+          Write-Host "── Node / NPM / Tools ───────────────────────────────────────"
+          node --version
+          npm --version
+          Write-Host "PowerShell Ver : $($PSVersionTable.PSVersion)"
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "  ✅  Device Info Collection Complete"
+          Write-Host "============================================================"
+
+      - name: Create bot.js
+        shell: pwsh
+        run: |
+          @'
+          const { chromium } = require("playwright");
+          const fs = require("fs");
+          const path = require("path");
+
+          const zedgeEmail = process.env.ZEDGE_EMAIL;
+          const zedgePassword = process.env.ZEDGE_PASSWORD;
+          const isHeadless = process.env.HEADLESS === "true";
+
+          const firebaseDatabaseURL = "https://zedge-r2-edward-hermes-default-rtdb.firebaseio.com"; // <-- CONFIG: your Firebase Realtime Database URL for account 1
+          const queuePath = "wallpaperQueue";
+          const r2WorkerUrl = "https://proud-paper-6fd7.monjurulgd2001.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
+
+          if (!zedgeEmail) throw new Error("Zedge email is required");
+          if (!zedgePassword) throw new Error("Zedge password is required");
+
+          async function firebaseGet(pathName) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`);
+            if (!res.ok) throw new Error(`Firebase GET failed: ${res.status}`);
+            return await res.json();
+          }
+
+          async function firebasePatch(pathName, data) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data)
+            });
+            if (!res.ok) throw new Error(`Firebase PATCH failed: ${res.status}`);
+            return await res.json();
+          }
+
+          async function firebaseDelete(pathName) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`, {
+              method: "DELETE"
+            });
+            if (!res.ok) throw new Error(`Firebase DELETE failed: ${res.status}`);
+            console.log(`Deleted from Firebase: ${pathName}`);
+          }
+
+          async function sendTelegramNotification(message) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) { console.log("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets missing) - skipping notification."); return; }
+            try {
+              const url = `https://api.telegram.org/bot${token}/sendMessage`;
+              const res = await fetch(url, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  text: message,
+                  parse_mode: "HTML"
+                })
+              });
+              if (!res.ok) {
+                const errText = await res.text().catch(() => "");
+                console.log(`Telegram API response failed: HTTP ${res.status} - ${errText}`);
+              } else {
+                console.log("Telegram notification successfully sent.");
+              }
+            } catch (err) {
+              console.log(`Error sending Telegram notification: ${err.message}`);
+            }
+          }
+
+          // ── Telegram helpers ─────────────────────────────────────────────────────
+          // Escape user-controlled text (titles, error messages) for parse_mode=HTML,
+          // otherwise a title containing < or & silently breaks the whole message.
+          function tgEscape(s) {
+            return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          }
+          function fmtDhakaTime(d = new Date()) {
+            try {
+              return d.toLocaleString("en-GB", { timeZone: "Asia/Dhaka", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).replace(",", " ·");
+            } catch (_) { return d.toISOString(); }
+          }
+          function fmtDuration(ms) {
+            const s = Math.max(0, Math.round(ms / 1000));
+            const m = Math.floor(s / 60), r = s % 60;
+            return m ? `${m} মিনিট ${r} সেকেন্ড` : `${r} সেকেন্ড`;
+          }
+          function fmtBytes(n) {
+            return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+          }
+
+          // Playwright ALWAYS records video as .webm (VP8). Telegram can't play that inline
+          // (it arrives as a file), so convert to H.264 MP4 before sending.
+          //   1) system ffmpeg (preinstalled on GitHub windows/ubuntu runners)
+          //   2) Playwright's bundled ffmpeg (may lack libx264 -> we fall through)
+          //   3) give up -> send the .webm as before
+          function findFfmpeg() {
+            const { execSync } = require("child_process");
+            try {
+              execSync(process.platform === "win32" ? "where ffmpeg" : "which ffmpeg", { stdio: "ignore" });
+              return "ffmpeg";
+            } catch (_) {}
+            const roots = [
+              process.env.PLAYWRIGHT_BROWSERS_PATH,
+              path.join(process.env.LOCALAPPDATA || "", "ms-playwright"),
+              path.join(process.env.HOME || process.env.USERPROFILE || "", ".cache", "ms-playwright")
+            ].filter(Boolean);
+            for (const root of roots) {
+              try {
+                for (const d of fs.readdirSync(root)) {
+                  if (!d.startsWith("ffmpeg")) continue;
+                  for (const c of ["ffmpeg-win64.exe", "ffmpeg-linux", "ffmpeg-mac"]) {
+                    const p = path.join(root, d, c);
+                    if (fs.existsSync(p)) return p;
+                  }
+                }
+              } catch (_) {}
+            }
+            return null;
+          }
+          function convertVideoToMp4(webmPath) {
+            try {
+              if (!webmPath || !fs.existsSync(webmPath)) return webmPath;
+              if (/\.mp4$/i.test(webmPath)) return webmPath;
+              const ff = findFfmpeg();
+              if (!ff) { console.log("⚠️ ffmpeg not found - sending .webm as-is"); return webmPath; }
+              const { execFileSync } = require("child_process");
+              const mp4Path = webmPath.replace(/\.webm$/i, "") + ".mp4";
+              const encode = (crf, scale) => {
+                const vf = scale ? `scale=${scale}` : "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+                execFileSync(ff, ["-y", "-loglevel", "error", "-i", webmPath,
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf), "-pix_fmt", "yuv420p",
+                  "-vf", vf, "-r", "25", "-movflags", "+faststart", "-an", mp4Path],
+                  { stdio: "ignore", timeout: 10 * 60 * 1000 });
+              };
+              encode(26, null);
+              const TG_LIMIT = 49 * 1024 * 1024; // Bot API upload cap is 50 MB
+              if (fs.statSync(mp4Path).size > TG_LIMIT) {
+                console.log("📹 mp4 > 49MB - re-encoding smaller (720p, crf 32)");
+                encode(32, "-2:720");
+              }
+              console.log(`🎬 Video converted: ${path.basename(webmPath)} (${fmtBytes(fs.statSync(webmPath).size)}) -> ${path.basename(mp4Path)} (${fmtBytes(fs.statSync(mp4Path).size)})`);
+              return mp4Path;
+            } catch (e) {
+              console.log(`⚠️ Video conversion failed (${e.message}) - sending .webm as-is`);
+              return webmPath;
+            }
+          }
+
+          async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) { console.log("Telegram not configured - skipping attachment."); return; }
+            try {
+              if (!fs.existsSync(filePath)) {
+                console.log(`Telegram attachment file not found: ${filePath}`);
+                return;
+              }
+              if (type === "video") filePath = convertVideoToMp4(filePath);
+              const fileBuffer = fs.readFileSync(filePath);
+              const blob = new Blob([fileBuffer]);
+              const formData = new FormData();
+              formData.append("chat_id", chatId);
+              if (caption) {
+                formData.append("caption", caption.slice(0, 1024)); // Telegram caption limit
+                formData.append("parse_mode", "HTML");
+              }
+              for (const [k, v] of Object.entries(extra || {})) formData.append(k, String(v));
+
+              let endpoint = "sendPhoto";
+              if (type === "video") {
+                endpoint = "sendVideo";
+                formData.append("supports_streaming", "true");
+                formData.append("video", blob, path.basename(filePath));
+              } else {
+                formData.append("photo", blob, path.basename(filePath));
+              }
+
+              const url = `https://api.telegram.org/bot${token}/${endpoint}`;
+              const res = await fetch(url, {
+                method: "POST",
+                body: formData
+              });
+              if (!res.ok) {
+                const errText = await res.text().catch(() => "");
+                console.log(`Telegram attachment (${type}) send failed: HTTP ${res.status} - ${errText}`);
+              } else {
+                console.log(`Telegram attachment (${type}) successfully sent.`);
+              }
+            } catch (err) {
+              console.log(`Error sending Telegram attachment (${type}): ${err.message}`);
+            }
+          }
+
+
+          function getDhakaGreeting() {
+            try {
+              const dhakaHour = parseInt(new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour: "2-digit", hour12: false }), 10);
+              let greetingTime = "শুভ দিন";
+              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "শুভ সকাল";
+              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
+              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
+              else greetingTime = "শুভ রাত্রি";
+              return `হ্যালো শাওন ভাই, ${greetingTime}`;
+            } catch (_) {
+              return "হ্যালো শাওন ভাই";
+            }
+          }
+
+          // --- PROFILE ROTATION STATE MANAGER ---
+
+          // Returns the next profile index whose upload count is still below perProfileLimit.
+          // Returns -1 if every profile has reached its limit for today.
+          function getNextAvailableProfile(lastUsedIndex, uploadCounts, total, perProfileLimit) {
+            let next = (lastUsedIndex + 1) % total;
+            for (let i = 0; i < total; i++) {
+              if ((uploadCounts[next] || 0) < perProfileLimit) return next;
+              next = (next + 1) % total;
+            }
+            return -1; // all profiles at their limit
+          }
+
+          async function getProfileState(totalProfilesCount) {
+            console.log("Checking profile rotation state...");
+            
+            // Get current date in Dhaka timezone (e.g. "5/1/2026")
+            const today = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }).split(",")[0];
+            
+            let state;
+            try {
+              state = await firebaseGet("uploadState");
+            } catch (e) {
+              state = null;
+            }
+
+            if (!state) {
+              state = {
+                lastUploadDate: "",
+                totalUploadsToday: 0,
+                lastUsedProfileIndex: -1,
+                totalProfilesAvailable: totalProfilesCount,
+                profileUploadCounts: {}
+              };
+            }
+
+            state.totalProfilesAvailable = totalProfilesCount;
+
+            // Backward-compat: older records may have profilesUsedToday array instead
+            if (typeof state.profileUploadCounts !== "object" || Array.isArray(state.profileUploadCounts)) {
+              state.profileUploadCounts = {};
+            }
+
+            if (state.lastUploadDate !== today) {
+              console.log("New day detected! Resetting daily upload count and profile usage.");
+              // ── Rotate upload type each new day through all 7 content types ──
+              const TYPE_CYCLE = ["AUDIO", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+              const DAY_LABELS = { AUDIO: "🎵 Ringtone", WALLPAPER: "🖼️ Wallpaper", WALLPAPER_24H: "🌅 24H Wallpaper", WALLPAPER_DUAL: "🔒 Dual Wallpaper", WALLPAPER_BATTERY: "🔋 Battery Wallpaper", LIVE_WALLPAPER: "🎬 Live Wallpaper", CHARGING_ANIMATION: "⚡ Charging Animation" };
+              const prevType = TYPE_CYCLE.includes(state.uploadDayType) ? state.uploadDayType : TYPE_CYCLE[TYPE_CYCLE.length - 1]; // if no record yet, cycle lands on AUDIO for Day 1
+              state.uploadDayType = TYPE_CYCLE[(TYPE_CYCLE.indexOf(prevType) + 1) % TYPE_CYCLE.length];
+              console.log(`📅 Day changed — today's upload type: ${state.uploadDayType} (${DAY_LABELS[state.uploadDayType]} day)`);
+              state.lastUploadDate = today;
+              state.totalUploadsToday = 0;
+              state.profileUploadCounts = {};
+              // lastUsedProfileIndex is intentionally NOT reset here so the rotation
+              // continues from where it left off across days.
+              // e.g. 6 profiles, limit 3/day: Day1→0,1,2  Day2→3,4,5  Day3→0,1,2 ...
+            }
+
+            // Ensure uploadDayType is always initialized (very first run ever)
+            if (!state.uploadDayType) {
+              state.uploadDayType = "AUDIO"; // First day defaults to ringtone
+              console.log("📅 First-ever run — defaulting to AUDIO (🎵 Ringtone) day");
+            }
+
+            const ZEDGE_DAILY_LIMIT = 3; // Zedge max uploads per day
+            if (state.totalUploadsToday >= ZEDGE_DAILY_LIMIT) {
+              console.log(`🛑 Zedge daily limit of ${ZEDGE_DAILY_LIMIT} uploads reached. Exiting safely.`);
+              process.exit(0); 
+            }
+
+            // How many uploads each profile may do today.
+            // Spreads the daily limit as evenly as possible across available profiles:
+            //   1 profile  → 3 uploads each
+            //   2 profiles → 2 uploads for first, 1 for second  (total = 3)
+            //   3+ profiles → 1 upload each
+            const perProfileLimit = Math.ceil(ZEDGE_DAILY_LIMIT / totalProfilesCount);
+
+            const nextProfileIndex = getNextAvailableProfile(state.lastUsedProfileIndex, state.profileUploadCounts, totalProfilesCount, perProfileLimit);
+
+            if (nextProfileIndex === -1) {
+              console.log("🛑 All profiles have reached their daily upload limit. Exiting safely.");
+              process.exit(0);
+            }
+
+            const countsDisplay = Object.entries(state.profileUploadCounts).map(([k,v]) => `P${k}:${v}`).join(", ") || "none";
+            console.log(`Upload counts today: {${countsDisplay}} | Per-profile limit: ${perProfileLimit} | Next: ${nextProfileIndex}`);
+            return { state, nextProfileIndex, perProfileLimit };
+          }
+
+          async function updateProfileStateAfterUpload(state, usedProfileIndex) {
+            console.log(`Updating state: Profile ${usedProfileIndex} was used. Total today is now ${state.totalUploadsToday + 1}`);
+            
+            const profileUploadCounts = { ...(state.profileUploadCounts || {}) };
+            profileUploadCounts[usedProfileIndex] = (profileUploadCounts[usedProfileIndex] || 0) + 1;
+
+            await firebasePatch("uploadState", {
+              lastUploadDate: state.lastUploadDate,
+              totalUploadsToday: state.totalUploadsToday + 1,
+              lastUsedProfileIndex: usedProfileIndex,
+              totalProfilesAvailable: state.totalProfilesAvailable,
+              profileUploadCounts,
+              uploadDayType: state.uploadDayType
+            });
+          }
+          // ----------------------------------------
+
+          const SET_SLOTS = {
+            WALLPAPER_24H: ["morning", "afternoon", "evening", "night"],
+            WALLPAPER_DUAL: ["lock", "home"],
+            WALLPAPER_BATTERY: ["critical", "low", "mid", "high", "full", "charging"]
+          };
+          const VIDEO_TYPES = ["LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+
+          function getItemContentType(item) {
+            if (item && item.contentType) return item.contentType;
+            const mp3 = item && (item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3")));
+            return mp3 ? "RINGTONE" : "WALLPAPER";
+          }
+
+          function slotFileUrl(item, slot) {
+            const v = item && item.files ? item.files[slot] : null;
+            return typeof v === "string" ? v : ((v && v.fileUrl) || "");
+          }
+
+          function hasSetFiles(item) {
+            const slots = SET_SLOTS[getItemContentType(item)];
+            if (!slots) return false;
+            return slots.every(s => slotFileUrl(item, s));
+          }
+
+          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false) {
+            console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType}${dayTypeLocked ? " - LOCKED for today" : ""})`);
+            console.log(`ACTIVE_DB: ${firebaseDatabaseURL}`);
+            const data = await firebaseGet(queuePath);
+            if (!data) throw new Error(`No items found in Realtime Database (${firebaseDatabaseURL})`);
+
+            // STALE CLAIM RECOVERY: if a previous run crashed hard (runner killed),
+            // an item can stay stuck in "processing" forever and would never upload.
+            // Recover claims older than 3h back to "queued" (max 2 recoveries, then "failed"
+            // so a repeatedly-crashing item can never be uploaded twice by accident).
+            const STALE_CLAIM_MS = 3 * 60 * 60 * 1000;
+            for (const [sid, sitem] of Object.entries(data)) {
+              if (!sitem || sitem.status !== "processing") continue;
+              const claimAge = Date.now() - (sitem.processingAt || 0);
+              if (claimAge <= STALE_CLAIM_MS) continue;
+              const recoveries = (sitem.staleRecoveries || 0) + 1;
+              if (recoveries > 2) {
+                console.log(`STALE_CLAIM => "${sitem.name || sid}" crashed ${recoveries} times - marking failed (manual requeue needed).`);
+                await firebasePatch(`${queuePath}/${sid}`, { status: "failed", error: "Stale processing claim - run crashed repeatedly", failedAt: Date.now() });
+                sitem.status = "failed";
+              } else {
+                console.log(`STALE_CLAIM => "${sitem.name || sid}" stuck in processing for ${Math.round(claimAge / 60000)} min - recovering to queued (recovery #${recoveries}).`);
+                await firebasePatch(`${queuePath}/${sid}`, { status: "queued", claimToken: null, processingAt: null, staleRecoveries: recoveries });
+                sitem.status = "queued";
+              }
+            }
+
+            const allQueued = Object.entries(data).filter(([_, item]) =>
+              item &&
+              item.status === "queued" &&
+              (item.fileBase64 || item.imageBase64 || item.fileUrl || hasSetFiles(item))
+            );
+
+            const typeCounts = {};
+            allQueued.forEach(([_, item]) => {
+              const t = getItemContentType(item);
+              typeCounts[t] = (typeCounts[t] || 0) + 1;
+            });
+            console.log(`QUEUE_COMPOSITION => total:${allQueued.length} | ${JSON.stringify(typeCounts)} | dayType:${dayType}`);
+
+            // Which queue content type belongs to today's day type
+            const wantedType = dayType === "AUDIO" ? "RINGTONE" : dayType;
+
+            // Pinned scheduling: items pinned to today's date (or overdue) take priority over the rotation
+            const todayKey = new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+            const pinnedEntries = allQueued
+              .filter(([_, item]) => item.scheduledDate && item.scheduledDate <= todayKey)
+              .sort((a, b) =>
+                String(a[1].scheduledDate).localeCompare(String(b[1].scheduledDate)) ||
+                ((a[1].createdAt || 0) - (b[1].createdAt || 0))
+              );
+            if (pinnedEntries.length) {
+              console.log(`PINNED_QUEUE => ${pinnedEntries.length} item(s) pinned for <= ${todayKey}; pinned item overrides rotation type.`);
+            }
+
+            // Oldest-first queued entries of one content type (not scheduled for a future day)
+            const entriesOfType = (t) => allQueued
+              .filter(([_, item]) => (!item.scheduledDate || item.scheduledDate <= todayKey) && getItemContentType(item) === t)
+              .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+
+            // DAY-TYPE SKIP (strict "each content on its own day"):
+            // If today's type has nothing queued (and nothing is pinned), we do NOT borrow
+            // another type onto this day. Instead the DAY ITSELF becomes the next type in the
+            // cycle that actually has stock, and the rotation continues from there.
+            //   e.g. WALLPAPER day, 0 wallpapers, 0 24H, 4 dual  ->  today becomes DUAL day,
+            //        tomorrow is BATTERY day, and so on.
+            // The new day type is persisted to Firebase so all runs today + tomorrow's rotation agree.
+            // FULL-DAY RULE: a content type only gets a day when it has a FULL day of stock
+            // (MIN_STOCK_FOR_DAY = 3). Types with 1-2 items WAIT until restocked (or are pinned
+            // manually). Once a rotation upload happens the day type is LOCKED - it never
+            // switches mid-day, so a day always shows exactly one content type.
+            const MIN_STOCK_FOR_DAY = 3;
+            let pickedType = wantedType;
+            let effectiveDayType = dayType;
+            let dayTypeSwitchedTo = null;
+            let entries = pinnedEntries.length ? pinnedEntries : entriesOfType(wantedType);
+            if (!pinnedEntries.length) {
+              if (dayTypeLocked) {
+                if (!entries.length) {
+                  throw new Error(`DAY_LOCKED => today is a ${dayType} day (locked) and no more ${wantedType} queued. Not switching type mid-day - nothing more to upload today.`);
+                }
+              } else if (entries.length < MIN_STOCK_FOR_DAY) {
+                const TYPE_CYCLE_SKIP = ["AUDIO", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+                const startIdx = Math.max(0, TYPE_CYCLE_SKIP.indexOf(dayType));
+                const waiting = [];
+                if (entries.length) waiting.push(`${wantedType}:${entries.length}/${MIN_STOCK_FOR_DAY}`);
+                let chosen = null;
+                for (let step = 1; step < TYPE_CYCLE_SKIP.length && !chosen; step++) {
+                  const tryDayType = TYPE_CYCLE_SKIP[(startIdx + step) % TYPE_CYCLE_SKIP.length];
+                  const tryType = tryDayType === "AUDIO" ? "RINGTONE" : tryDayType;
+                  const found = entriesOfType(tryType);
+                  if (found.length >= MIN_STOCK_FOR_DAY) {
+                    chosen = { tryDayType, tryType, found };
+                  } else if (found.length) {
+                    waiting.push(`${tryType}:${found.length}/${MIN_STOCK_FOR_DAY}`);
+                  }
+                }
+                if (!chosen) {
+                  throw new Error(`WAIT_FOR_STOCK => no content type has a full day of stock (>= ${MIN_STOCK_FOR_DAY}). Waiting: [${waiting.join(", ")}]. Add more files or pin an item manually. Nothing uploaded.`);
+                }
+                pickedType = chosen.tryType;
+                effectiveDayType = chosen.tryDayType;
+                dayTypeSwitchedTo = chosen.tryDayType;
+                entries = chosen.found;
+                console.log(`DAY_TYPE_SKIP => ${dayType} day has only ${entriesOfType(wantedType).length}/${MIN_STOCK_FOR_DAY} ${wantedType}; today is now a ${chosen.tryDayType} day (${chosen.found.length} available). Waiting for restock: [${waiting.join(", ") || "none"}]`);
+                // Persist immediately so the dashboard + later runs today see the switched type
+                await firebasePatch("uploadState", { uploadDayType: dayTypeSwitchedTo });
+              }
+            }
+
+            if (!entries.length) {
+              throw new Error(`Queue is completely EMPTY - no uploadable item of ANY type found. Queue => ${JSON.stringify(typeCounts)}. DB=${firebaseDatabaseURL}`);
+            }
+
+            const [id, item] = entries[0];
+            const localDir = path.join(process.cwd(), "downloads");
+            fs.mkdirSync(localDir, { recursive: true });
+
+            const contentType = getItemContentType(item);
+            const isMp3 = contentType === "RINGTONE";
+
+            // Defensive guard (double-check); pinned and fallback picks may legally differ from the rotation type
+            const isPinnedPick = Boolean(item.scheduledDate && item.scheduledDate <= todayKey);
+            if (isPinnedPick) {
+              console.log(`PINNED_PICK => "${item.name || id}" was scheduled for ${item.scheduledDate} (today: ${todayKey})`);
+            } else if (contentType !== pickedType) {
+              throw new Error(`Day/type mismatch guard triggered. dayType=${effectiveDayType}, pickedType=${pickedType}, item=${item.name || id}, contentType=${contentType}`);
+            } else if (dayTypeSwitchedTo) {
+              console.log(`DAY_TYPE_SKIP_UPLOAD => uploading ${contentType} "${item.name || id}" - day switched ${dayType} -> ${dayTypeSwitchedTo} (no ${wantedType} queued).`);
+            }
+
+            // ANTI DOUBLE-UPLOAD GUARD: claim this item FIRST with a unique token,
+            // then verify we own the claim. If any other run already claimed this file,
+            // abort immediately so the same file can NEVER be uploaded twice.
+            const claimToken = `claim-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            await firebasePatch(`${queuePath}/${id}`, {
+              status: "processing",
+              processingAt: Date.now(),
+              claimToken
+            });
+            const claimCheck = await firebaseGet(`${queuePath}/${id}`);
+            if (!claimCheck || claimCheck.claimToken !== claimToken) {
+              throw new Error(`Queue item ${id} was already claimed by another run - aborting to prevent double upload.`);
+            }
+
+            async function downloadToFile(url, filePath, label) {
+              console.log(`Downloading ${label} from R2: ${url}`);
+              const res = await fetch(url);
+              if (!res.ok) throw new Error(`Failed to download ${label} from R2: HTTP ${res.status}`);
+              const arrayBuffer = await res.arrayBuffer();
+              fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+            }
+
+            let localFile;
+            let localFiles = [];
+            let fileUrls = [];
+            let localThumb = null;
+
+            if (SET_SLOTS[contentType]) {
+              // Multi-image set (24H / Dual / Battery) - download every slot image in order
+              if (!hasSetFiles(item)) {
+                throw new Error(`${contentType} item ${id} is missing one or more slot images (${SET_SLOTS[contentType].join(", ")})`);
+              }
+              for (const slot of SET_SLOTS[contentType]) {
+                const slotUrl = slotFileUrl(item, slot);
+                const slotFile = path.join(localDir, `${id}-${slot}.jpg`);
+                await downloadToFile(slotUrl, slotFile, `${contentType} ${slot} image`);
+                localFiles.push(slotFile);
+                fileUrls.push(slotUrl);
+              }
+              localFile = localFiles[0];
+              console.log(`${contentType} set ready - ${localFiles.length} images downloaded`);
+            } else if (VIDEO_TYPES.includes(contentType)) {
+              // Video content (Live Wallpaper / Charging Animation) + auto thumbnail
+              const isMov = item.name && item.name.toLowerCase().endsWith(".mov");
+              localFile = path.join(localDir, `${id}${isMov ? ".mov" : ".mp4"}`);
+              await downloadToFile(item.fileUrl, localFile, item.name || id);
+              localFiles = [localFile];
+              fileUrls = [item.fileUrl];
+              if (item.thumbUrl) {
+                localThumb = path.join(localDir, `${id}-thumb.jpg`);
+                await downloadToFile(item.thumbUrl, localThumb, "cover thumbnail");
+                fileUrls.push(item.thumbUrl);
+              } else {
+                console.warn(`${contentType} item ${id} has no thumbUrl - cover image step will be skipped`);
+              }
+            } else {
+              const isJpeg = item.name && item.name.toLowerCase().endsWith(".jpeg");
+              const ext = isMp3 ? ".mp3" : (isJpeg ? ".jpeg" : ".jpg");
+              localFile = path.join(localDir, `${id}${ext}`);
+
+              console.log(`Saving queued item: ${item.name || id} as ${ext}`);
+              if (item.fileUrl) {
+                await downloadToFile(item.fileUrl, localFile, item.name || id);
+              } else {
+                const base64Data = item.fileBase64 || item.imageBase64;
+                if (base64Data) {
+                  const base64 = base64Data.includes(",")
+                    ? base64Data.split(",")[1]
+                    : base64Data;
+                  fs.writeFileSync(localFile, Buffer.from(base64, "base64"));
+                } else {
+                  throw new Error(`Queue item ${id} is missing both fileUrl and base64 data`);
+                }
+              }
+              localFiles = [localFile];
+              if (item.fileUrl) fileUrls = [item.fileUrl];
+            }
+
+            // Item already claimed above (anti double-upload guard) - no re-claim needed.
+
+            return {
+              id,
+              localFile,
+              localFiles,
+              localThumb,
+              contentType,
+              isMp3,
+              dayTypeSwitchedTo,
+              isPinnedPick,
+              name:        item.name || id,
+              title:       item.title || "",
+              tags:        item.tags || "",
+              category:    item.category || "",
+              description: item.description || "",
+              fileUrl:     item.fileUrl || "",
+              fileUrls
+            };
+          }
+
+          async function markWallpaperDoneAndDelete(id, name, fileUrlOrUrls) {
+            console.log(`Upload successful - deleting "${name}" from Firebase...`);
+            await firebaseDelete(`${queuePath}/${id}`);
+            console.log(`"${name}" permanently removed from Firebase queue`);
+
+            const urls = (Array.isArray(fileUrlOrUrls) ? fileUrlOrUrls : [fileUrlOrUrls]).filter(Boolean);
+
+            for (const fileUrl of urls) {
+              let fileKey = "";
+              try {
+                const u = new URL(fileUrl);
+                fileKey = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+              } catch {
+                // fallback for malformed URL strings
+                fileKey = String(fileUrl).replace(/^https?:\/\/[^/]+\//i, "");
+              }
+
+              try {
+                console.log(`R2 delete request => fileUrl: ${fileUrl}`);
+                console.log(`R2 delete request => parsed key: ${fileKey}`);
+
+                const res = await fetch(r2WorkerUrl, {
+                  method: "DELETE",
+                  headers: {
+                    "X-File-Name": fileKey
+                  }
+                });
+
+                const body = await res.text().catch(() => "");
+                if (res.ok) {
+                  console.log(`Successfully deleted key "${fileKey}" from Cloudflare R2. Status=${res.status} Body=${body}`);
+                } else {
+                  console.warn(`R2 delete failed for key "${fileKey}". Status=${res.status} Body=${body}`);
+                }
+              } catch (err) {
+                console.error(`Failed to delete "${fileKey}" from R2:`, err.message);
+              }
+            }
+          }
+
+          async function markWallpaperFailed(id, error) {
+            await firebasePatch(`${queuePath}/${id}`, {
+              status: "failed",
+              error: String(error).slice(0, 1000),
+              failedAt: Date.now()
+            });
+          }
+
+          async function getVpnTimezone(browser) {
+            const providers = [
+              { url: "https://ipwho.is/", parse: d => d.timezone?.id },
+              { url: "https://ipinfo.io/json", parse: d => d.timezone },
+              { url: "http://ip-api.com/json", parse: d => d.timezone }
+            ];
+
+            for (const provider of providers) {
+              let ctx;
+              try {
+                ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+                const page = await ctx.newPage();
+                console.log(`Checking timezone via ${provider.url}`);
+                await page.goto(provider.url, { waitUntil: "domcontentloaded" });
+                const text = await page.locator("body").innerText();
+                if (!text || !text.trim().startsWith("{")) throw new Error("Response is not JSON");
+                const data = JSON.parse(text);
+                const tz = provider.parse(data);
+                if (!tz) throw new Error("No timezone found");
+                await ctx.close();
+                console.log(`Detected timezone: ${tz}`);
+                return tz;
+              } catch (err) {
+                console.log(`Timezone provider failed: ${err.message}`);
+                if (ctx) await ctx.close().catch(() => {});
+              }
+            }
+
+            console.log("Using fallback timezone: Asia/Dhaka");
+            return "Asia/Dhaka";
+          }
+
+          async function safeClick(locator, label, timeout = 30000) {
+            console.log(`Clicking ${label}`);
+            await locator.waitFor({ state: "visible", timeout });
+            await locator.scrollIntoViewIfNeeded();
+            await locator.click();
+          }
+
+          async function safeClickWithPopupRecovery(page, locator, label, timeout = 30000, retries = 4) {
+            let lastErr = null;
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                await dismissConsentPopup(page);
+                await page.waitForTimeout(300);
+                await safeClick(locator, `${label} (attempt ${attempt}/${retries})`, timeout);
+                return;
+              } catch (err) {
+                lastErr = err;
+                console.log(`⚠️ Click failed for ${label} on attempt ${attempt}: ${err.message}`);
+                await dismissConsentPopup(page).catch(() => {});
+                await page.evaluate(() => {
+                  document.body.style.overflow = "";
+                  document.documentElement.style.overflow = "";
+                  const nodes = [...document.querySelectorAll("*")];
+                  let touched = 0;
+                  for (const el of nodes) {
+                    try {
+                      const s = window.getComputedStyle(el);
+                      if ((s.position === "fixed" || s.position === "sticky") &&
+                          parseInt(s.zIndex || "0", 10) >= 999 &&
+                          el.offsetWidth >= window.innerWidth * 0.9 &&
+                          el.offsetHeight >= window.innerHeight * 0.6) {
+                        el.style.pointerEvents = "none";
+                        el.style.display = "none";
+                        touched++;
+                      }
+                    } catch (_) {}
+                  }
+                  return touched;
+                }).catch(() => {});
+                await page.waitForTimeout(700);
+              }
+            }
+            throw new Error(`Failed to click ${label} after ${retries} attempts. Last error: ${lastErr?.message || "unknown"}`);
+          }
+
+          async function safeType(locator, value, label) {
+            console.log(`Typing ${label}`);
+            await locator.waitFor({ state: "visible" });
+            await locator.scrollIntoViewIfNeeded();
+            await locator.click();
+            await locator.fill("");
+            await locator.pressSequentially(value, { delay: 90 });
+          }
+
+          async function scrollFullPage(page) {
+            await page.evaluate(async () => {
+              await new Promise(resolve => {
+                let lastY = -1;
+                const step = () => {
+                  window.scrollBy(0, 500);
+                  if (window.scrollY === lastY || window.scrollY + window.innerHeight >= document.body.scrollHeight) {
+                    resolve();
+                    return;
+                  }
+                  lastY = window.scrollY;
+                  requestAnimationFrame(step);
+                };
+                step();
+              });
+            });
+          }
+
+          async function scrollToElement(locator) {
+            await locator.waitFor({ state: "attached" });
+            await locator.evaluate(el => {
+              el.scrollIntoView({ block: "center", inline: "center" });
+            });
+          }
+
+          async function dismissConsentPopup(page) {
+            console.log("Checking for consent/cookie popups in all frames...");
+            let clickedAny = false;
+
+            const acceptPriority = [
+              "accept all cookies",
+              "accept all",
+              "agree to all",
+              "accept cookies",
+              "i agree",
+              "agree",
+              "allow all",
+              "allow",
+              "continue",
+              "accept & continue",
+              "got it",
+              "ok",
+              "okay",
+              "proceed",
+              "understand"
+            ];
+
+            const negativeWords = ["reject", "disagree", "decline", "optional", "deny"];
+
+            const socialOrLoginKeywords = [
+              "facebook", "google", "apple", "email", "password", 
+              "login", "log in", "signin", "sign in", "signup", "sign up", 
+              "register", "create account", "continue with", "facebook lite", "sign up"
+            ];
+
+            for (const frame of page.frames()) {
+              try {
+                const clicked = await frame.evaluate(({ acceptPriority, negativeWords, socialOrLoginKeywords }) => {
+                  const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
+                  
+                  const isLoginPage = window.location.href.includes("account.zedge.net") || 
+                                       window.location.href.includes("login") || 
+                                       !!document.querySelector('input[type="email"], input[type="password"]');
+
+                  const isConsentContainer = (el) => {
+                    let cur = el;
+                    while (cur) {
+                      const id = (cur.id || "").toLowerCase();
+                      const className = (typeof cur.className === "string" ? cur.className : "").toLowerCase();
+                      const role = (cur.getAttribute?.("role") || "").toLowerCase();
+                      if (id.includes("didomi") || className.includes("didomi") ||
+                          id.includes("consent") || className.includes("consent") ||
+                          id.includes("cookie") || className.includes("cookie") ||
+                          id.includes("privacy") || className.includes("privacy") ||
+                          id.includes("popup") || className.includes("popup") ||
+                          role === "dialog" || role === "alertdialog") {
+                        return true;
+                      }
+                      cur = cur.parentElement;
+                    }
+                    return false;
+                  };
+
+                  const candidates = [];
+                  for (const btn of buttons) {
+                    const rect = btn.getBoundingClientRect();
+                    const isVisible = rect.width > 0 && rect.height > 0 && 
+                                      window.getComputedStyle(btn).display !== "none" && 
+                                      window.getComputedStyle(btn).visibility !== "hidden";
+                    if (!isVisible) continue;
+
+                    const text = (btn.innerText || "").trim().toLowerCase();
+                    const ariaLabel = (btn.getAttribute("aria-label") || "").trim().toLowerCase();
+                    const title = (btn.getAttribute("title") || "").trim().toLowerCase();
+                    const id = (btn.id || "").trim().toLowerCase();
+                    const className = (typeof btn.className === "string" ? btn.className : "").trim().toLowerCase();
+                    const combined = `${text} ${ariaLabel} ${title} ${id} ${className}`.trim();
+
+                    if (!combined) continue;
+
+                    if (negativeWords.some(w => combined.includes(w))) continue;
+                    if (socialOrLoginKeywords.some(w => combined.includes(w))) continue;
+                    if (isLoginPage && !isConsentContainer(btn)) continue;
+
+                    candidates.push({ btn, text, ariaLabel, title, combined });
+                  }
+
+                  for (const phrase of acceptPriority) {
+                    const match = candidates.find(c => {
+                      if (phrase === "ok" || phrase === "okay" || phrase === "agree" || phrase === "allow" || phrase === "continue") {
+                        const words = c.text.split(/\s+/);
+                        return words.includes(phrase) || c.text === phrase;
+                      }
+                      return c.text === phrase || c.ariaLabel === phrase || c.title === phrase || c.combined.includes(phrase);
+                    });
+
+                    if (match) {
+                      match.btn.click();
+                      return { clicked: true, text: match.text || match.ariaLabel || "button" };
+                    }
+                  }
+
+                  const generic = candidates.find(c =>
+                    c.combined.includes("accept") || c.combined.includes("agree")
+                  );
+                  if (generic) {
+                    generic.btn.click();
+                    return { clicked: true, text: generic.text || "generic button" };
+                  }
+
+                  return { clicked: false };
+                }, { acceptPriority, negativeWords, socialOrLoginKeywords });
+
+                if (clicked && clicked.clicked) {
+                  console.log(`✅ Clicked consent accept element: "${clicked.text}" in frame: ${frame.url()}`);
+                  clickedAny = true;
+                  await page.waitForTimeout(500);
+                }
+              } catch (_) {}
+            }
+
+            // Fallback close/remove only if no accept click happened
+            if (!clickedAny) {
+              try {
+                const nuked = await page.evaluate(() => {
+                  let killed = 0;
+
+                  function nukeElements(root) {
+                    let k = 0;
+                    if (!root) return k;
+
+                    const selectors = [
+                      '#didomi-host',
+                      '.didomi-popup',
+                      '[id*="didomi"]',
+                      '[class*="didomi"]',
+                      'dialog',
+                      '[role="dialog"]',
+                      '[class*="consent"]',
+                      '[class*="cookie"]',
+                      '[class*="privacy"]',
+                      '[class*="modal"]',
+                      '[class*="popup"]',
+                      '[class*="dialog"]',
+                      '[class*="overlay"]',
+                      '[class*="backdrop"]',
+                      '[class*="banner"]',
+                      '[class*="notification"]',
+                      '[class*="alert"]',
+                      '[class*="announcement"]',
+                      '[id*="consent"]',
+                      '[id*="cookie"]',
+                      '[id*="privacy"]',
+                      '[id*="modal"]',
+                      '[id*="popup"]',
+                      '[id*="dialog"]',
+                      '[id*="overlay"]',
+                      '[id*="backdrop"]',
+                      '[id*="banner"]'
+                    ];
+
+                    function isProtected(el) {
+                      if (!el) return false;
+                      if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
+                      
+                      let current = el;
+                      while (current) {
+                        if (current.tagName === 'DIALOG' || 
+                            current.getAttribute('role') === 'dialog' || 
+                            current.classList.contains('sc-gKXOVf') ||
+                            current.classList.contains('dwmyJL')) {
+                          
+                          if (current.id === 'didomi-host') return false;
+                          
+                          const text = (current.innerText || current.textContent || "").toLowerCase();
+                          const uploadKeywords = [
+                            "upload",
+                            "wallpaper",
+                            "ringtone",
+                            "edit meta",
+                            "publish",
+                            "content policy",
+                            "ownership",
+                            "title",
+                            "tags",
+                            "category",
+                            "description",
+                            "success",
+                            "pending",
+                            "published"
+                          ];
+                          if (uploadKeywords.some(kw => text.includes(kw))) {
+                            return true;
+                          }
+                        }
+                        current = current.parentElement;
+                      }
+                      return false;
+                    }
+
+                    selectors.forEach(sel => {
+                      const els = root.querySelectorAll(sel);
+                      els.forEach(el => {
+                        if (!isProtected(el)) {
+                          el.remove();
+                          k++;
+                        }
+                      });
+                    });
+
+                    // Traverse shadow roots recursively
+                    const allEls = root.querySelectorAll('*');
+                    allEls.forEach(el => {
+                      if (el.shadowRoot) {
+                        k += nukeElements(el.shadowRoot);
+                      }
+                    });
+
+                    return k;
+                  }
+
+                  killed += nukeElements(document);
+
+                  const iframes = document.querySelectorAll(
+                    'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
+                    'iframe[id*="consent"], iframe[id*="cookie"]'
+                  );
+                  iframes.forEach(iframe => {
+                    iframe.remove();
+                    killed++;
+                  });
+
+                  if (killed > 0 || document.getElementById('didomi-host')) {
+                    document.body.style.setProperty("overflow", "auto", "important");
+                    document.documentElement.style.setProperty("overflow", "auto", "important");
+                    document.body.style.setProperty("pointer-events", "auto", "important");
+                    document.documentElement.style.setProperty("pointer-events", "auto", "important");
+                  }
+                  return killed;
+                });
+                if (nuked > 0) {
+                  console.log(`✅ JS removed ${nuked} blocking elements.`);
+                  clickedAny = true;
+                }
+              } catch (_) {}
+            }
+
+            return clickedAny;
+          }
+
+          // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
+          async function installPrivacyPopupWatcher(page) {
+            // DISABLED: This automatic watcher was interfering with the explicit Didomi cookie consent handler
+            // by auto-clicking buttons before the proper consent flow could complete.
+            // The Didomi consent modal is now handled explicitly after page load.
+            console.log("Privacy popup auto-watcher is disabled - using explicit Didomi handler instead");
+          }
+
+          async function forceCheckByDataHook(page, dataHookValue, label) {
+            console.log(`Force checking: ${label}`);
+
+            await page.waitForSelector(
+              `input[data-hook="${dataHookValue}-input"]`,
+              { state: "attached", timeout: 30000 }
+            );
+
+            await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              if (!input) throw new Error(`Checkbox input not found: ${hook}`);
+              input.click();
+            }, dataHookValue);
+
+            const isChecked = await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              return input ? input.checked : false;
+            }, dataHookValue);
+
+            if (!isChecked) {
+              console.log(`${label} not checked after click — forcing via JS property`);
+              await page.evaluate((hook) => {
+                const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+                if (!input) throw new Error(`Checkbox input not found: ${hook}`);
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, "checked"
+                ).set;
+                nativeInputValueSetter.call(input, true);
+                input.dispatchEvent(new Event("click", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+                input.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                input.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              }, dataHookValue);
+            }
+
+            const finalChecked = await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              return input ? input.checked : false;
+            }, dataHookValue);
+
+            if (!finalChecked) throw new Error(`Failed to check checkbox: ${label}`);
+            console.log(`${label} confirmed checked`);
+          }
+
+          async function uploadWallpaperInDialog(page, localFile) {
+            console.log("Waiting for Upload dialog (with file input inside)");
+
+            // Wait specifically for an upload dialog that contains the file input — not the type-selection menu
+            let dialog;
+            try {
+              await page.waitForSelector(
+                'input[data-hook="form-field-files-input"]',
+                { state: "attached", timeout: 30000 }
+              );
+              console.log("Upload dialog detected via file input");
+              dialog = page.locator('[role="dialog"]').filter({ has: page.locator('input[data-hook="form-field-files-input"]') }).first();
+              if (!(await dialog.count())) {
+                // Fallback: maybe it's a full page instead of dialog
+                console.log("No dialog wrapper found — treating whole page as upload form");
+                dialog = page.locator("body");
+              }
+            } catch (e) {
+              await page.screenshot({ path: "zedge-dialog-error.png", fullPage: true });
+              throw new Error(`Upload dialog did not appear after 30s. Check zedge-dialog-error.png. Original: ${e.message}`);
+            }
+            await page.waitForTimeout(1000);
+
+            await forceCheckByDataHook(page, "form-field-accept-input", "first ownership checkbox");
+            await page.waitForTimeout(500);
+
+            await forceCheckByDataHook(page, "form-field-acceptContentPolicy-input", "second content policy checkbox");
+            await page.waitForTimeout(500);
+
+            console.log("Waiting for file input");
+            const fileInput = dialog
+              .locator('input[data-hook="form-field-files-input"]')
+              .first();
+
+            await fileInput.waitFor({ state: "attached" });
+            const filesToUpload = Array.isArray(localFile) ? localFile : [localFile];
+            console.log(`Uploading ${filesToUpload.length} file(s)`);
+            await fileInput.setInputFiles(filesToUpload);
+
+            await page.waitForFunction((expectedCount) => {
+              const input = document.querySelector('input[data-hook="form-field-files-input"]');
+              return input && input.files && input.files.length >= expectedCount;
+            }, filesToUpload.length);
+
+            console.log("Waiting for Upload button to become enabled");
+            const uploadButton = dialog
+              .locator('button[type="submit"]:has-text("Upload")')
+              .first();
+
+            await uploadButton.waitFor({ state: "visible" });
+            await scrollToElement(uploadButton);
+
+            await page.waitForFunction(() => {
+              const buttons = [...document.querySelectorAll('button[type="submit"]')];
+              const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
+              return upload && upload.disabled === false;
+            });
+
+            await uploadButton.click();
+
+            console.log("Waiting for Edit meta button");
+            const editMetaButton = page
+              .locator('[role="dialog"] button:has-text("Edit meta")')
+              .first();
+
+            await editMetaButton.waitFor({ state: "visible" });
+
+            await page.waitForFunction(() => {
+              const buttons = [...document.querySelectorAll("button")];
+              const editMeta = buttons.find(btn => btn.textContent.trim() === "Edit meta");
+              return editMeta && editMeta.disabled === false;
+            });
+
+            await scrollToElement(editMetaButton);
+            await editMetaButton.click();
+            console.log("Clicked Edit meta");
+          }
+
+          async function fillMetaDialog(page, meta) {
+            console.log("Waiting for meta dialog to open");
+
+            await page.waitForSelector(
+              'input[data-hook="form-field-name-input"]',
+              { state: "visible", timeout: 30000 }
+            );
+
+            await page.waitForTimeout(800);
+
+            // \u2500\u2500 COVER IMAGE (Live Wallpaper / Charging Animation) \u2500\u2500
+            if (meta.coverImage) {
+              try {
+                console.log("Uploading cover image (auto thumbnail)");
+                const addCover = page.locator('a:has-text("Add cover image")').first();
+                await addCover.waitFor({ state: "visible", timeout: 15000 });
+                await scrollToElement(addCover);
+                await addCover.click();
+                console.log("Clicked Add cover image");
+
+                const coverDialog = page.locator('[role="dialog"]').filter({ hasText: "Upload cover image" }).first();
+                await coverDialog.waitFor({ state: "visible", timeout: 15000 });
+
+                const coverInput = coverDialog.locator('input[data-hook="form-field-files-input"]').first();
+                await coverInput.waitFor({ state: "attached" });
+                await coverInput.setInputFiles(meta.coverImage);
+                console.log("Cover image file set");
+                await page.waitForTimeout(800);
+
+                for (const hook of ["form-field-accept-input", "form-field-acceptContentPolicy-input"]) {
+                  const cb = coverDialog.locator(`[data-hook="${hook}"]`).first();
+                  if (await cb.count()) {
+                    await cb.click({ force: true });
+                    await page.waitForTimeout(300);
+                  }
+                }
+
+                const coverSubmit = coverDialog.locator('button[type="submit"]:has-text("Upload")').first();
+                await page.waitForFunction(() => {
+                  const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+                  const dlg = dialogs.find(d => d.textContent.includes("Upload cover image"));
+                  if (!dlg) return false;
+                  const btn = [...dlg.querySelectorAll('button[type="submit"]')].find(b => b.textContent.trim() === "Upload");
+                  return btn && btn.disabled === false;
+                }, { timeout: 20000 });
+                await coverSubmit.click();
+                await coverDialog.waitFor({ state: "detached", timeout: 30000 }).catch(() => {});
+                console.log("Cover image uploaded");
+                await page.waitForTimeout(1000);
+              } catch (e) {
+                console.warn(`Cover image upload issue (continuing): ${e.message}`);
+              }
+            }
+
+            // ── TITLE ──────────────────────────────────────────────
+            console.log("Filling title");
+            const titleInput = page.locator('input[data-hook="form-field-name-input"]').first();
+            await titleInput.waitFor({ state: "visible" });
+            await scrollToElement(titleInput);
+            await titleInput.click();
+            
+            const title = String(meta.title || "").slice(0, 30);
+            await titleInput.fill(title);
+            await titleInput.press('Tab'); 
+            await page.waitForTimeout(300);
+            console.log(`Title filled: "${title}"`);
+
+            // ── TAGS ───────────────────────────────────────────────
+            if (meta.tags) {
+              const tagList = String(meta.tags)
+                .split(",")
+                .map(t => t.trim())
+                .filter(Boolean)
+                .filter(t => t.length >= 2)
+                .slice(0, 10);
+
+              console.log(`Filling ${tagList.length} valid tags`);
+              
+              const tagsInput = page.locator('.react-select__input').nth(0);
+
+              for (const tag of tagList) {
+                await tagsInput.waitFor({ state: "attached" });
+                await scrollToElement(tagsInput);
+                await tagsInput.click({ force: true });
+                await tagsInput.fill(tag);
+                await page.waitForTimeout(300);
+                await tagsInput.press("Enter");
+                await page.waitForTimeout(200);
+                console.log(`Tag added: "${tag}"`);
+              }
+              await tagsInput.press('Tab');
+            }
+
+            // ── CATEGORY ───────────────────────────────────────────
+            if (meta.category) {
+              console.log(`Filling category: "${meta.category}"`);
+              
+              const categoryInput = page.locator('.react-select__input').nth(1);
+              
+              await categoryInput.waitFor({ state: "attached" });
+              await scrollToElement(categoryInput);
+              await categoryInput.click({ force: true });
+              
+              await categoryInput.fill(String(meta.category));
+              await page.waitForTimeout(500);
+
+              await categoryInput.press("Enter");
+              await categoryInput.press('Tab');
+              console.log(`Category selected: "${meta.category}"`);
+            }
+
+            // ── DESCRIPTION ────────────────────────────────────────
+            if (meta.description) {
+              console.log("Filling description");
+              const descInput = page.locator('textarea[data-hook="form-field-description-input"]').first();
+              await descInput.waitFor({ state: "visible" });
+              await scrollToElement(descInput);
+              await descInput.click();
+              
+              const desc = String(meta.description || "").slice(0, 200);
+              await descInput.fill(desc);
+              
+              await descInput.press('Tab');
+              await page.waitForTimeout(300);
+              console.log(`Description filled`);
+            }
+
+            // ── VIDEO AD RADIO BUTTON ──────────────────────────────
+            console.log("Scrolling to lock type section");
+
+            await page.waitForSelector(
+              'input[name="lockType"]',
+              { state: "attached", timeout: 15000 }
+            );
+
+            await page.evaluate(() => {
+              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
+              const videoAdRadio = wrappers.find(input => {
+                const container = input.closest('.sc-fHsOPI') || input.parentElement;
+                return container && container.textContent.includes("Video ad");
+              });
+
+              if (!videoAdRadio) throw new Error("Video ad radio button not found");
+
+              videoAdRadio.scrollIntoView({ block: "center" });
+              videoAdRadio.click();
+
+              videoAdRadio.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+
+            await page.waitForTimeout(500);
+
+            const videoAdSelected = await page.evaluate(() => {
+              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
+              const videoAdRadio = wrappers.find(input => {
+                const container = input.closest('.sc-fHsOPI') || input.parentElement;
+                return container && container.textContent.includes("Video ad");
+              });
+              return videoAdRadio ? videoAdRadio.checked : false;
+            });
+
+            if (!videoAdSelected) {
+              console.log("Video ad not selected via JS click — trying Playwright locator");
+
+              const videoAdWrapper = page
+                .locator('.sc-fHsOPI')
+                .filter({ hasText: "Video ad" })
+                .first();
+
+              await scrollToElement(videoAdWrapper);
+              const radioInWrapper = videoAdWrapper.locator('input[type="radio"]').first();
+              await radioInWrapper.click({ force: true });
+              await page.waitForTimeout(400);
+            }
+
+            console.log("Video ad radio selected");
+
+            // ── PUBLISH BUTTON ────────────────────────────────────
+            console.log("Looking for Publish button");
+
+            const publishButton = page
+              .locator('button')
+              .filter({ hasText: /^Publish$/ })
+              .first();
+
+            await publishButton.waitFor({ state: "visible", timeout: 15000 });
+            await scrollToElement(publishButton);
+            await page.waitForTimeout(300);
+            await publishButton.click();
+
+            console.log("Clicked Publish");
+          }
+
+          async function verifyPublishStatus(page) {
+            console.log("Waiting 5 seconds before checking status...");
+            await page.waitForTimeout(5000);
+
+            let attempts = 0;
+            const maxAttempts = 50;
+
+            while (attempts < maxAttempts) {
+              attempts++;
+              console.log(`Reloading page to fetch latest server status (Attempt ${attempts}/${maxAttempts})...`);
+              
+              await page.reload({ waitUntil: "domcontentloaded" });
+              
+              try {
+                await page.waitForSelector('span[type="INFO"], span[type="SUCCESS"], span.sc-jtJlRs', { state: 'attached', timeout: 15000 });
+                await page.waitForTimeout(1000);
+              } catch (e) {
+                console.log("Warning: Badges didn't load in time after refresh. Network might be slow.");
+              }
+
+              const pending = page.locator('span').filter({ hasText: /^PENDING$/ }).first();
+              const published = page.locator('span').filter({ hasText: /^PUBLISHED$/ }).first();
+              const inReview = page.locator('span').filter({ hasText: /^IN REVIEW$/i }).first();
+              const rejected = page.locator('span').filter({ hasText: /^REJECTED$/i }).first();
+
+              if (await published.isVisible()) {
+                console.log("Status confirmed: PUBLISHED! Excellent. Stopping checks.");
+                return { removed: false, statusName: "PUBLISHED" };
+              }
+
+              if (await pending.isVisible() || await inReview.isVisible() || await rejected.isVisible()) {
+                let statusName = "PENDING";
+                if (await inReview.isVisible()) statusName = "IN REVIEW";
+                else if (await rejected.isVisible()) statusName = "REJECTED";
+
+                console.log(`Status is ${statusName}. Initiating removal process...`);
+
+                const ellipsisBtn = page.locator('button:has(svg[data-icon="ellipsis-h"])').first();
+                await scrollToElement(ellipsisBtn);
+                await ellipsisBtn.click();
+                console.log("Clicked ellipsis menu");
+                await page.waitForTimeout(1000);
+
+                const removeBtn = page.locator('button').filter({ hasText: /^Remove$/ }).first();
+                await removeBtn.waitFor({ state: "visible" });
+                await removeBtn.click();
+                console.log("Clicked Remove dropdown option");
+
+                const confirmBtn = page.locator('button[data-hook="z-modal-submit"]');
+                await confirmBtn.waitFor({ state: "visible" });
+                await confirmBtn.click();
+                console.log("Confirmed deletion on modal.");
+                
+                await page.waitForTimeout(2000);
+
+                // Return result instead of throwing — so the upload loop can still count this as an attempt
+                return { removed: true, statusName };
+              }
+
+              console.log("No recognizable status badge found yet. Could be loading or lost context...");
+              await page.waitForTimeout(20000);
+            }
+            
+            console.log("Warning: Status check timed out. Proceeding anyway.");
+            return { removed: false, statusName: "UNKNOWN" };
+          }
+
+          // ── Random Fingerprint Pool ────────────────────────────────
+          const FP_USER_AGENTS = [
+            // ── Chrome on Windows ──────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            // ── Microsoft Edge on Windows ──────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.3124.51",
+            // ── Chrome on macOS ────────────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            // ── Firefox on Windows ─────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            // ── Chrome on Linux ────────────────────────────────────────
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            // ── Chrome on Windows (extra versions) ────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            // ── Edge on Windows (extra versions) ──────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            // ── Chrome on macOS (extra versions) ──────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            // ── Safari on macOS ────────────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
+            // ── Firefox on Windows (extra versions) ───────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            // ── Firefox on macOS ───────────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
+            // ── Opera on Windows ───────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+            // ── Brave on Windows ───────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Brave/135",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Brave/130",
+            // ── Chrome on Android (mobile) ─────────────────────────────
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.6478.122 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.86 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+            // ── Samsung Internet on Android ────────────────────────────
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/130.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
+            // ── Chrome on Linux (extra) ────────────────────────────────
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
+          ];
+          const FP_VIEWPORTS = [
+            { width: 1366, height: 768 },
+            { width: 1440, height: 900 },
+            { width: 1280, height: 800 },
+            { width: 1536, height: 864 },
+            { width: 1600, height: 900 },
+            { width: 1280, height: 720 },
+            { width: 1920, height: 1080 }
+          ];
+          const FP_GL_RENDERERS = [
+            "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (Intel, Intel(R) HD Graphics 630 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (AMD, AMD Radeon RX 570 Series Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (Intel, Intel(R) Iris Xe Graphics Direct3D11 vs_5_0 ps_5_0)"
+          ];
+          const FP_VENDORS = ["Google Inc. (Intel)", "Google Inc. (NVIDIA)", "Google Inc. (AMD)", "Google Inc."];
+          const FP_HC     = [2, 4, 4, 6, 8, 8, 12, 16];
+          const FP_DM     = [2, 4, 4, 8, 8];
+          function fpRand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+          // ─────────────────────────────────────────────────────────────
+
+          (async () => {
+            let browser = null;
+            let context = null;
+
+            // Profile count is set via the workflow "total_profiles" input (default: 3)
+            let TOTAL_PROFILES = parseInt(process.env.TOTAL_PROFILES || "3", 10);
+            if (!Number.isFinite(TOTAL_PROFILES) || TOTAL_PROFILES < 1) TOTAL_PROFILES = 1;
+            let profileCountWarned = false; // Telegram warning sent once per run
+
+            try {
+              // 1. Check Limits & figure out how many uploads we can still do today
+              const ZEDGE_DAILY_LIMIT = 3;
+              const profileStateData = await getProfileState(TOTAL_PROFILES);
+              // 3 runs per day (morning / noon / evening) - upload only 1 item per run.
+              // Daily cap of ZEDGE_DAILY_LIMIT (3) is still enforced across all runs of the day.
+              const UPLOADS_PER_RUN = 1;
+              const remainingUploads = Math.min(UPLOADS_PER_RUN, ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday);
+              let currentProfileIndex = profileStateData.nextProfileIndex;
+              let perProfileLimit     = profileStateData.perProfileLimit;
+              let currentState = profileStateData.state;
+
+              console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
+
+              // ── Read today's upload type from Firebase state ──────────────────────────────
+              let dayType = profileStateData.state.uploadDayType || "AUDIO";
+              const DAY_TYPE_LOGS = { AUDIO: "🎵 AUDIO (Ringtone)", WALLPAPER: "🖼️ WALLPAPER (Image)", WALLPAPER_24H: "🌅 DYNAMIC 24H WALLPAPER", WALLPAPER_DUAL: "🔒 DUAL WALLPAPER", WALLPAPER_BATTERY: "🔋 BATTERY WALLPAPER", LIVE_WALLPAPER: "🎬 LIVE WALLPAPER", CHARGING_ANIMATION: "⚡ CHARGING ANIMATION" };
+              console.log(`📅 Today's upload type: ${DAY_TYPE_LOGS[dayType] || dayType} day`);
+
+              // 2. Filter UA pool by selected group then pick random fingerprint
+              const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
+              const UA_GROUPS_MAP = {
+                chrome_windows: FP_USER_AGENTS.filter(u => u.includes("Windows") && u.includes("Chrome") && !u.includes("Edg/") && !u.includes("OPR/") && !u.includes("Brave") && !u.includes("Firefox")),
+                edge_windows:   FP_USER_AGENTS.filter(u => u.includes("Edg/")),
+                firefox:        FP_USER_AGENTS.filter(u => u.includes("Firefox")),
+                chrome_macos:   FP_USER_AGENTS.filter(u => u.includes("Macintosh") && u.includes("Chrome") && !u.includes("Version/")),
+                safari_macos:   FP_USER_AGENTS.filter(u => u.includes("Version/") && u.includes("Safari/605")),
+                android_mobile: FP_USER_AGENTS.filter(u => u.includes("Android"))
+              };
+              const fpUAPool = (UA_GROUPS_MAP[UA_GROUP_SEL] && UA_GROUPS_MAP[UA_GROUP_SEL].length > 0)
+                ? UA_GROUPS_MAP[UA_GROUP_SEL]
+                : FP_USER_AGENTS;
+              console.log(`\ud83c\udf10 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
+              const fpVP       = fpRand(FP_VIEWPORTS);
+              const fpUA       = fpRand(fpUAPool);
+              const fpHC       = fpRand(FP_HC);
+              const fpDM       = fpRand(FP_DM);
+              const fpRenderer = fpRand(FP_GL_RENDERERS);
+              const fpVendor   = fpRand(FP_VENDORS);
+              const fpNoise    = Array.from({ length: 8 }, () => Math.floor(Math.random() * 3));
+              console.log(`🎭 Fingerprint: ${fpVP.width}x${fpVP.height} | HC:${fpHC} | DM:${fpDM}GB | UA:...${fpUA.slice(-50)}`);
+
+              // 2. Start Browser ONCE for the whole run
+              browser = await chromium.launch({
+                headless: isHeadless,
+                args: [
+                  "--no-sandbox",
+                  "--disable-webrtc",
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--disable-blink-features=AutomationControlled",
+                  "--disable-features=IsolateOrigins,site-per-process",
+                  "--disable-dev-shm-usage",
+                  "--no-first-run",
+                  "--no-default-browser-check",
+                  `--window-size=${fpVP.width},${fpVP.height}`
+                ]
+              });
+
+              // ── VPN watchdog: hard-stop the bot the moment the WireGuard tunnel drops ──
+              const { execSync } = require("child_process");
+              const vpnTunnelFile = path.join(process.cwd(), "vpn.tunnel");
+              const vpnCheck = setInterval(() => {
+                try {
+                  const tunnel = fs.readFileSync(vpnTunnelFile, "utf8").trim();
+                  const out = execSync(`sc query "WireGuardTunnel$${tunnel}"`, { encoding: "utf8" });
+                  if (!/RUNNING/.test(out)) throw new Error("WireGuard tunnel not running");
+                } catch (e) {
+                  console.error("VPN DISCONNECTED! Shutting down immediately...");
+                  process.exit(1);
+                }
+              }, 5000);
+
+              const tz = await getVpnTimezone(browser);
+
+              context = await browser.newContext({
+                viewport:            fpVP,
+                locale:              "en-US",
+                timezoneId:          tz,
+                userAgent:           fpUA,
+                colorScheme:         "light",
+                ignoreHTTPSErrors:   true,
+                recordVideo: { dir: "videos/", size: fpVP }
+              });
+
+              context.setDefaultTimeout(0);
+              context.setDefaultNavigationTimeout(0);
+
+              await context.addInitScript((fp) => {
+                // Hide automation
+                Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+                delete navigator.__proto__.webdriver;
+
+                // Disable WebRTC
+                Object.defineProperty(window, "RTCPeerConnection",       { value: undefined });
+                Object.defineProperty(window, "webkitRTCPeerConnection", { value: undefined });
+                Object.defineProperty(navigator, "mediaDevices",         { value: undefined });
+
+                // Navigator fingerprint
+                Object.defineProperty(navigator, "hardwareConcurrency", { get: () => fp.hc });
+                Object.defineProperty(navigator, "deviceMemory",        { get: () => fp.dm });
+                Object.defineProperty(navigator, "platform",            { get: () => "Win32" });
+                Object.defineProperty(navigator, "languages",           { get: () => ["en-US", "en"] });
+                Object.defineProperty(navigator, "language",            { get: () => "en-US" });
+                Object.defineProperty(navigator, "vendor",              { get: () => "Google Inc." });
+                Object.defineProperty(navigator, "maxTouchPoints",      { get: () => 0 });
+
+                // Screen fingerprint
+                Object.defineProperty(screen, "width",       { get: () => fp.sw });
+                Object.defineProperty(screen, "height",      { get: () => fp.sh });
+                Object.defineProperty(screen, "availWidth",  { get: () => fp.sw });
+                Object.defineProperty(screen, "availHeight", { get: () => fp.sh - 40 });
+                Object.defineProperty(screen, "colorDepth",  { get: () => 24 });
+                Object.defineProperty(screen, "pixelDepth",  { get: () => 24 });
+
+                // Canvas noise — subtle ±1-2 pixel shift on readback
+                const _origGID = CanvasRenderingContext2D.prototype.getImageData;
+                CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {
+                  const id = _origGID.call(this, sx, sy, sw, sh);
+                  const n = fp.noise;
+                  for (let i = 0; i < id.data.length; i += 4) {
+                    id.data[i]   = Math.min(255, id.data[i]   + n[i % 8]);
+                    id.data[i+1] = Math.min(255, id.data[i+1] + n[(i+1) % 8]);
+                    id.data[i+2] = Math.min(255, id.data[i+2] + n[(i+2) % 8]);
+                  }
+                  return id;
+                };
+
+                // WebGL vendor + renderer spoof
+                const _origGP = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {
+                  if (param === 37445) return fp.vendor;    // UNMASKED_VENDOR_WEBGL
+                  if (param === 37446) return fp.renderer;  // UNMASKED_RENDERER_WEBGL
+                  return _origGP.call(this, param);
+                };
+                const _origGP2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(param) {
+                  if (param === 37445) return fp.vendor;
+                  if (param === 37446) return fp.renderer;
+                  return _origGP2.call(this, param);
+                };
+
+                // Plugins spoof (non-empty list looks more human)
+                Object.defineProperty(navigator, "plugins", {
+                  get: () => {
+                    const p = { length: 3, 0: { name: "Chrome PDF Plugin" }, 1: { name: "Chrome PDF Viewer" }, 2: { name: "Native Client" }, item: i => this[i], namedItem: n => null, refresh: () => {} };
+                    return p;
+                  }
+                });
+
+                // ── Font Fingerprint Noise ─────────────────────────────
+                // Intercept measureText so font-probing scripts get
+                // slightly randomised metrics instead of the real ones.
+                const _origMT = CanvasRenderingContext2D.prototype.measureText;
+                CanvasRenderingContext2D.prototype.measureText = function(text) {
+                  const metrics = _origMT.call(this, text);
+                  const noise = fp.noise[text.length % 8] * 0.05;
+                  Object.defineProperty(metrics, "width", {
+                    get: () => metrics.width + noise
+                  });
+                  return metrics;
+                };
+
+                // Block common font-detection APIs used by fingerprinters
+                const _origFF = document.fonts ? document.fonts.check.bind(document.fonts) : null;
+                if (_origFF && document.fonts) {
+                  document.fonts.check = function(font, text) {
+                    // Always return true — prevents font enumeration
+                    return true;
+                  };
+                }
+
+                // ── Audio Fingerprint Noise ────────────────────────────
+                // Add imperceptible noise to AudioBuffer to break audio FP
+                const _origCC = AudioBuffer.prototype.getChannelData;
+                AudioBuffer.prototype.getChannelData = function(channel) {
+                  const data = _origCC.call(this, channel);
+                  const seed = fp.noise[channel % 8];
+                  for (let i = 0; i < data.length; i += 100) {
+                    data[i] += seed * 0.0000001;
+                  }
+                  return data;
+                };
+
+                // Also spoof AnalyserNode float data
+                if (typeof AnalyserNode !== "undefined") {
+                  const _origGA = AnalyserNode.prototype.getFloatFrequencyData;
+                  AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+                    _origGA.call(this, arr);
+                    const seed = fp.noise[0] * 0.001;
+                    for (let i = 0; i < arr.length; i++) {
+                      arr[i] += seed;
+                    }
+                  };
+                }
+
+                // Background Modal/Popup Observer
+                try {
+                  const observer = new MutationObserver(() => {
+                    try {
+                      const selectors = [
+                        '#didomi-host',
+                        '.didomi-popup',
+                        '[id*="didomi"]',
+                        '[class*="didomi"]',
+                        'dialog',
+                        '[role="dialog"]',
+                        '[class*="consent"]',
+                        '[class*="cookie"]',
+                        '[class*="privacy"]',
+                        '[class*="modal"]',
+                        '[class*="popup"]',
+                        '[class*="dialog"]',
+                        '[class*="overlay"]',
+                        '[class*="backdrop"]',
+                        '[class*="banner"]',
+                        '[class*="notification"]',
+                        '[class*="alert"]',
+                        '[class*="announcement"]',
+                        '[id*="consent"]',
+                        '[id*="cookie"]',
+                        '[id*="privacy"]',
+                        '[id*="modal"]',
+                        '[id*="popup"]',
+                        '[id*="dialog"]',
+                        '[id*="overlay"]',
+                        '[id*="backdrop"]',
+                        '[id*="banner"]'
+                      ];
+
+                      function isProtected(el) {
+                        if (!el) return false;
+                        if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
+                        
+                        let current = el;
+                        while (current) {
+                          if (current.tagName === 'DIALOG' || 
+                              current.getAttribute('role') === 'dialog' || 
+                              current.classList.contains('sc-gKXOVf') ||
+                              current.classList.contains('dwmyJL')) {
+                            
+                            if (current.id === 'didomi-host') return false;
+                            
+                            const text = (current.innerText || current.textContent || "").toLowerCase();
+                            const uploadKeywords = [
+                              "upload",
+                              "wallpaper",
+                              "ringtone",
+                              "edit meta",
+                              "publish",
+                              "content policy",
+                              "ownership",
+                              "title",
+                              "tags",
+                              "category",
+                              "description",
+                              "success",
+                              "pending",
+                              "published"
+                            ];
+                            if (uploadKeywords.some(kw => text.includes(kw))) {
+                              return true;
+                            }
+                          }
+                          current = current.parentElement;
+                        }
+                        return false;
+                      }
+
+                      let killed = 0;
+
+                      function checkAndNuke(root) {
+                        if (!root) return;
+                        selectors.forEach(sel => {
+                          const els = root.querySelectorAll(sel);
+                          els.forEach(el => {
+                            if (!isProtected(el)) {
+                              el.remove();
+                              killed++;
+                            }
+                          });
+                        });
+
+                        // Traverse shadow DOMs recursively
+                        const allEls = root.querySelectorAll('*');
+                        allEls.forEach(el => {
+                          if (el.shadowRoot) {
+                            checkAndNuke(el.shadowRoot);
+                          }
+                        });
+                      }
+
+                      checkAndNuke(document);
+
+                      if (killed > 0 || document.getElementById('didomi-host')) {
+                        document.body.style.setProperty("overflow", "auto", "important");
+                        document.documentElement.style.setProperty("overflow", "auto", "important");
+                        document.body.style.setProperty("pointer-events", "auto", "important");
+                        document.documentElement.style.setProperty("pointer-events", "auto", "important");
+                      }
+                    } catch (_) {}
+                  });
+
+                  if (document.documentElement) {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                  } else {
+                    document.addEventListener("DOMContentLoaded", () => {
+                      observer.observe(document.documentElement, { childList: true, subtree: true });
+                    });
+                  }
+                } catch (_) {}
+              }, {
+                hc:       fpHC,
+                dm:       fpDM,
+                sw:       fpVP.width,
+                sh:       fpVP.height,
+                noise:    fpNoise,
+                vendor:   fpVendor,
+                renderer: fpRenderer
+              });
+
+              const page = await context.newPage();
+
+              // Install persistent background watcher for Zedge privacy/cookie popups
+              await installPrivacyPopupWatcher(page);
+
+              await page.setExtraHTTPHeaders({
+                "Accept-Language": "en-US,en;q=0.9"
+              });
+
+              // 3. BrowserLeaks check ONCE
+              console.log("Opening BrowserLeaks");
+              await page.goto("https://browserleaks.com/ip", { waitUntil: "domcontentloaded" });
+              await page.waitForLoadState("networkidle");
+              await scrollFullPage(page);
+              await page.evaluate(() => window.scrollTo(0, 0));
+
+              // 4. Login ONCE
+              console.log("Opening Zedge");
+              await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+              await page.waitForLoadState("networkidle");
+              await page.waitForTimeout(2000);
+
+              // Screenshot to capture exactly what the page shows before login attempt
+              await page.screenshot({ path: "zedge-before-login.png", fullPage: true });
+              console.log(`Page URL before login: ${page.url()}`);
+              console.log(`Page title before login: ${await page.title()}`);
+
+              // ── DIDOMI CONSENT POPUP HANDLER ──────────────────
+              // Handles the Didomi cookie consent modal by clicking Accept/Close button
+              // This ensures proper consent is registered with the website
+              // ──────────────────────────────────────────────────────────────
+              console.log("Checking for Didomi cookie consent modal...");
+              
+              try {
+                // Wait for Didomi modal to appear (with timeout)
+                const didomiModal = page.locator('#didomi-host');
+                await didomiModal.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+                const modalVisible = await didomiModal.isVisible().catch(() => false);
+                
+                if (modalVisible) {
+                  console.log("✅ Didomi consent modal detected - handling cookie consent...");
+                  
+                  // Try to click Accept/Close button
+                  const acceptButton = page.locator('#didomi-notice-agree-button');
+                  const acceptExists = await acceptButton.isVisible({ timeout: 3000 }).catch(() => false);
+                  
+                  if (acceptExists) {
+                    console.log('Clicking "Accept All Cookies" or "Close" button...');
+                    await acceptButton.click();
+                    await page.waitForTimeout(1000);
+                    console.log('✅ Successfully clicked Accept/Close button');
+                  } else {
+                    // Fallback: Try "Do not Share/Sell" button if Accept not found
+                    const learnMoreButton = page.locator('#didomi-notice-learn-more-button');
+                    const learnMoreExists = await learnMoreButton.isVisible({ timeout: 2000 }).catch(() => false);
+                    
+                    if (learnMoreExists) {
+                      console.log('Clicking "Do not Share or Sell my Personal Information" button...');
+                      await learnMoreButton.click();
+                      await page.waitForTimeout(1000);
+                      console.log('✅ Successfully clicked "Do not Share or Sell" button');
+                    } else {
+                      console.log('⚠️ No clickable Didomi buttons found - modal may require manual intervention');
+                    }
+                  }
+                  
+                  // Verify modal is gone
+                  await page.waitForTimeout(500);
+                  const stillVisible = await didomiModal.isVisible().catch(() => false);
+                  if (!stillVisible) {
+                    console.log("✅ Didomi consent modal successfully dismissed");
+                  } else {
+                    console.log("⚠️ Modal may still be visible, proceeding anyway...");
+                  }
+                } else {
+                  console.log("ℹ️ No Didomi consent modal detected (already dismissed or not present)");
+                }
+              } catch (err) {
+                console.error("⚠️ Error handling Didomi consent:", err.message);
+                console.log("Attempting to proceed with login anyway...");
+              }
+
+              await safeClickWithPopupRecovery(
+                page,
+                page.locator('[data-hook="za-login-email"]').first(),
+                "Continue with Email",
+                30000,
+                5
+              );
+
+              await safeType(
+                page.locator('[data-hook="form-field-email-input"]'),
+                zedgeEmail,
+                "email"
+              );
+
+              await safeClick(
+                page.locator('button[data-hook="za-submit"]'),
+                "Continue"
+              );
+
+              await safeType(
+                page.locator('[data-hook="form-field-password-input"]'),
+                zedgePassword,
+                "password"
+              );
+
+              await safeClick(
+                page.locator('button[data-hook="za-submit"]'),
+                "Login"
+              );
+
+              console.log("Waiting for login success bell icon");
+              await page.locator('svg[data-icon="bell"]').waitFor({ state: "visible" });
+              await page.screenshot({ path: "zedge-after-login.png", fullPage: true });
+
+              // ─────────────────────────────────────────────────────────────
+              // 5. UPLOAD LOOP — repeat up to remainingUploads times
+              // ─────────────────────────────────────────────────────────────
+              let successCount = 0;
+              let failedCount = 0;
+              let removedCount = 0;
+              const runStartedAt = Date.now();
+              const runLabel = process.env.FOLDER_NAME || "Zedge Bot";
+              const DAILY_LIMIT_UI = 3; // matches ZEDGE_DAILY_LIMIT
+              const DAY_TYPE_BN = { AUDIO: "🎵 রিংটোন ডে", WALLPAPER: "🖼️ ওয়ালপেপার ডে", WALLPAPER_24H: "🌅 ২৪ ঘণ্টার ওয়ালপেপার ডে", WALLPAPER_DUAL: "🔒 ডুয়াল ওয়ালপেপার ডে", WALLPAPER_BATTERY: "🔋 ব্যাটারি ওয়ালপেপার ডে", LIVE_WALLPAPER: "🎬 লাইভ ওয়ালপেপার ডে", CHARGING_ANIMATION: "⚡ চার্জিং অ্যানিমেশন ডে" };
+              const CTYPE_BN = {
+                RINGTONE: "অডিও (রিংটোন)",
+                WALLPAPER: "ওয়ালপেপার",
+                WALLPAPER_24H: "২৪ ঘণ্টার ওয়ালপেপার সেট",
+                WALLPAPER_DUAL: "ডুয়াল ওয়ালপেপার সেট",
+                WALLPAPER_BATTERY: "ব্যাটারি ওয়ালপেপার সেট",
+                LIVE_WALLPAPER: "লাইভ ওয়ালপেপার",
+                CHARGING_ANIMATION: "চার্জিং অ্যানিমেশন"
+              };
+              const STATUS_UI = {
+                PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", UNKNOWN: "❓ UNKNOWN"
+              };
+              const ctypeLabel = (qi) => CTYPE_BN[qi?.contentType] || (qi?.isMp3 ? CTYPE_BN.RINGTONE : CTYPE_BN.WALLPAPER);
+              // Card-style message builder: header line + key/value rows + footer
+              const tgCard = (header, rows, footer) => {
+                const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `${k} ${v}`).join("\n");
+                return [header, "━━━━━━━━━━━━━━━━", body, footer ? `\n${footer}` : ""].filter(Boolean).join("\n");
+              };
+
+              for (let i = 0; i < remainingUploads; i++) {
+                let queueItem = null;
+                const uploadNum = i + 1;
+
+                console.log(`\n========================================`);
+                console.log(`Upload ${uploadNum} of ${remainingUploads} | Profile Index: ${currentProfileIndex}`);
+                console.log(`========================================`);
+
+                try {
+                  // Fetch the next queued item
+                  const dayTypeLocked = Boolean(currentState.dayTypeLockedDate) && currentState.dayTypeLockedDate === currentState.lastUploadDate;
+                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked);
+                  if (queueItem.dayTypeSwitchedTo && queueItem.dayTypeSwitchedTo !== dayType) {
+                    // Keep local state in sync so updateProfileStateAfterUpload() does not
+                    // write the OLD day type back to Firebase, and so tomorrow rotates from the new one.
+                    dayType = queueItem.dayTypeSwitchedTo;
+                    currentState = { ...currentState, uploadDayType: dayType };
+                    console.log(`📅 Day type switched -> ${DAY_TYPE_LOGS[dayType] || dayType} day (own type had no stock).`);
+                  }
+                } catch (e) {
+                  const reason = e && e.message ? e.message : String(e);
+                  console.log(`Nothing to upload after ${successCount} upload(s): ${reason}`);
+                  console.log("Stopping loop.");
+                  // Tell the user WHY nothing was uploaded (only when this run did nothing at all)
+                  if (successCount === 0 && i === 0) {
+                    let why = "কিউতে আপলোড করার মতো কোনো ফাইল নেই।";
+                    let hint = "💡 ড্যাশবোর্ড থেকে নতুন ফাইল অ্যাড করুন।";
+                    if (/WAIT_FOR_STOCK/.test(reason)) {
+                      const waitingList = (reason.match(/Waiting: \[([^\]]*)\]/) || [])[1] || "";
+                      why = "কোনো কনটেন্ট টাইপের পুরো এক দিনের স্টক (৩টি ফাইল) নেই।";
+                      hint = `⏳ অপেক্ষায়: <code>${tgEscape(waitingList || "-")}</code>\n💡 আরও ফাইল অ্যাড করুন অথবা ক্যালেন্ডারে ম্যানুয়ালি পিন করুন।`;
+                    } else if (/DAY_LOCKED/.test(reason)) {
+                      why = "আজকের কনটেন্ট টাইপের আর কোনো ফাইল কিউতে নেই। দিনের টাইপ লক থাকায় অন্য টাইপ নেওয়া হয়নি।";
+                      hint = "💡 আগামীকাল রোটেশন স্বাভাবিকভাবে পরের টাইপে যাবে।";
+                    }
+                    const idleMsg = tgCard(
+                      `ℹ️ <b>আজ কোনো আপলোড হয়নি</b>`,
+                      [
+                        ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                        ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                        ["📝 কারণ:", why],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      hint
+                    );
+                    await sendTelegramNotification(idleMsg);
+                  }
+                  break;
+                }
+
+                try {
+                  // Navigate back to Zedge portal for each upload
+                  console.log("Navigating to Zedge upload portal");
+                  await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+                  await page.waitForLoadState("networkidle");
+
+                  // Click Profiles tab
+                  await safeClick(
+                    page.locator('a:has-text("Profiles")').first(),
+                    "Profiles"
+                  );
+
+                  // ── Profile-count guard ───────────────────────────────────────────
+                  // Count how many profile cards REALLY exist on this account and never
+                  // click an index that does not exist (e.g. total_profiles=3 but the
+                  // account only has 1 profile -> nth(1) timeout).
+                  const profileCards = page.locator('[data-hook="profile-list"] > div');
+                  try { await profileCards.first().waitFor({ state: "visible", timeout: 30000 }); } catch (_) {}
+                  const actualProfiles = await profileCards.count();
+                  console.log(`Profiles on account: ${actualProfiles} | configured total_profiles: ${TOTAL_PROFILES}`);
+                  if (actualProfiles === 0) {
+                    throw new Error("No profile found on the Zedge Profiles page ([data-hook=\"profile-list\"] is empty). Create/approve a profile first.");
+                  }
+                  if (actualProfiles < TOTAL_PROFILES) {
+                    const configured = TOTAL_PROFILES;
+                    TOTAL_PROFILES = actualProfiles;
+                    perProfileLimit = Math.ceil(ZEDGE_DAILY_LIMIT / TOTAL_PROFILES);
+                    console.warn(`⚠️ total_profiles=${configured} but only ${actualProfiles} profile(s) exist. Using ${actualProfiles}; per-profile limit is now ${perProfileLimit}.`);
+                    if (currentProfileIndex >= TOTAL_PROFILES) {
+                      const fixedIdx = getNextAvailableProfile(TOTAL_PROFILES - 1, currentState.profileUploadCounts, TOTAL_PROFILES, perProfileLimit);
+                      currentProfileIndex = fixedIdx === -1 ? 0 : fixedIdx;
+                      console.warn(`⚠️ Profile index adjusted to ${currentProfileIndex}`);
+                    }
+                    if (!profileCountWarned) {
+                      profileCountWarned = true;
+                      try {
+                        await sendTelegramNotification(tgCard(
+                          `⚠️ <b>প্রোফাইল সংখ্যা মিলছে না</b>`,
+                          [
+                            ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                            ["⚙️ total_profiles ইনপুট:", String(configured)],
+                            ["👤 অ্যাকাউন্টে আছে:", String(actualProfiles)],
+                            ["🕒 সময়:", fmtDhakaTime()]
+                          ],
+                          `✅ বট নিজে থেকে ${actualProfiles} টি প্রোফাইল ধরে চলছে।\n💡 পরের বার workflow চালানোর সময় <code>total_profiles = ${actualProfiles}</code> দিন।`
+                        ));
+                      } catch (_) {}
+                    }
+                  }
+                  // ─────────────────────────────────────────────────────────────────
+
+                  // Click the correct rotated profile
+                  await safeClick(
+                    profileCards.nth(currentProfileIndex),
+                    `Profile Index ${currentProfileIndex}`
+                  );
+
+                  // Wait for the profile page to fully render before touching anything.
+                  await page.waitForLoadState("networkidle");
+                  await page.waitForTimeout(1500);
+
+                  // Navigate directly to the correct content-type URL so we never need to
+                  // interact with the unreliable type-selection modal.
+                  // URL shape: .../profiles/<profileId>/content/WALLPAPER  (or AUDIO)
+                  const profilePageUrl = page.url();
+                  const profileBase    = profilePageUrl.replace(/\/content\/[^\/].*$/, "");
+                  const ZEDGE_TYPE_URLS = {
+                    RINGTONE: "AUDIO",
+                    WALLPAPER: "WALLPAPER",
+                    WALLPAPER_24H: "DYNAMIC_24H_WALLPAPER",
+                    WALLPAPER_DUAL: "DYNAMIC_DUAL_LOCK_WALLPAPER",
+                    WALLPAPER_BATTERY: "DYNAMIC_BATTERY_LEVEL_WALLPAPER",
+                    LIVE_WALLPAPER: "LIVE_WALLPAPER",
+                    CHARGING_ANIMATION: "CHARGE_SCREEN"
+                  };
+                  const itemCType = queueItem.contentType || (queueItem.isMp3 ? "RINGTONE" : "WALLPAPER");
+                  const targetType = ZEDGE_TYPE_URLS[itemCType] || (queueItem.isMp3 ? "AUDIO" : "WALLPAPER");
+                  const targetContentUrl = `${profileBase}/content/${targetType}`;
+                  console.log(`Navigating directly to ${targetType} page: ${targetContentUrl}`);
+                  await page.goto(targetContentUrl, { waitUntil: "domcontentloaded" });
+                  await page.waitForLoadState("networkidle");
+                  await page.waitForTimeout(1000);
+
+                  // Click the Upload (+) button — now already on the right content-type page
+                  await safeClick(
+                    page.locator("svg.fa-plus").first(),
+                    "Upload plus icon"
+                  );
+
+                  // Wait for upload dialog to appear
+                  await page.waitForTimeout(800);
+                  await page.screenshot({ path: `zedge-upload-menu-${uploadNum}.png`, fullPage: false });
+
+                  // Upload the file(s) - 24H sets pass all 4 images at once
+                  const filesForUpload = (queueItem.localFiles && queueItem.localFiles.length) ? queueItem.localFiles : queueItem.localFile;
+                  await uploadWallpaperInDialog(page, filesForUpload);
+
+                  // Fill in meta (title, tags, category, description)
+                  await fillMetaDialog(page, {
+                    title:       queueItem.title,
+                    tags:        queueItem.tags,
+                    category:    queueItem.category,
+                    description: queueItem.description,
+                    coverImage:  queueItem.localThumb || null
+                  });
+
+                  // Check publish status — returns {removed, statusName} instead of throwing
+                  const publishResult = await verifyPublishStatus(page);
+
+                  const finalShotPath = `zedge-final-${uploadNum}.png`;
+                  await page.screenshot({ path: finalShotPath, fullPage: true });
+
+                  // Always delete from Firebase queue and count the upload on the profile,
+                  // regardless of whether it was PUBLISHED or removed (PENDING/IN REVIEW/REJECTED).
+                  // Only a true technical error (catch block) skips this.
+                  await markWallpaperDoneAndDelete(queueItem.id, queueItem.name, (queueItem.fileUrls && queueItem.fileUrls.length) ? queueItem.fileUrls : queueItem.fileUrl);
+                  await updateProfileStateAfterUpload(currentState, currentProfileIndex);
+
+                  // LOCK today's day type after the first rotation (non-pinned) upload,
+                  // so the type can never switch mid-day.
+                  if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
+                    await firebasePatch("uploadState", { dayTypeLockedDate: currentState.lastUploadDate });
+                    currentState = { ...currentState, dayTypeLockedDate: currentState.lastUploadDate };
+                    console.log(`🔒 Day type ${dayType} locked for today.`);
+                  }
+
+                  // Advance local state for next iteration
+                  const profileUploadCounts = { ...(currentState.profileUploadCounts || {}) };
+                  profileUploadCounts[currentProfileIndex] = (profileUploadCounts[currentProfileIndex] || 0) + 1;
+                  currentState = {
+                    ...currentState,
+                    totalUploadsToday: currentState.totalUploadsToday + 1,
+                    lastUsedProfileIndex: currentProfileIndex,
+                    profileUploadCounts
+                  };
+
+                  successCount++;
+
+                  const fileTypeLabel = ctypeLabel(queueItem);
+                  const greeting = getDhakaGreeting();
+                  const statusLine = `<b>${STATUS_UI[publishResult.statusName] || tgEscape(publishResult.statusName)}</b>`;
+                  const todayProgress = `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI}`;
+                  const itemTitle = tgEscape(queueItem.title || queueItem.name);
+                  let notifyMsg = "";
+                  if (publishResult.removed) {
+                    removedCount++;
+                    notifyMsg = tgCard(
+                      `⚠️ <b>Zedge কনটেন্ট সরিয়ে দিয়েছে</b>`,
+                      [
+                        ["👋", `${greeting}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
+                        ["📌 Zedge স্ট্যাটাস:", statusLine],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      "💡 ফাইলটি কিউ থেকে সরানো হয়েছে এবং আজকের আপলোড লিমিটে গণনা করা হয়েছে। Zedge এটি রিভিউয়ে রেখেছে/রিজেক্ট করেছে — কনটেন্ট গাইডলাইন চেক করে দেখুন।"
+                    );
+                    console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
+                  } else {
+                    notifyMsg = tgCard(
+                      `✅ <b>আপলোড সম্পন্ন</b>`,
+                      [
+                        ["👋", `${greeting}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
+                        ["📌 Zedge স্ট্যাটাস:", statusLine],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      publishResult.statusName === "PUBLISHED"
+                        ? "🎉 কনটেন্টটি এখন Zedge-এ লাইভ।"
+                        : "⏳ Zedge রিভিউ শেষ হলে লাইভ হবে।"
+                    );
+                    console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
+                  }
+                  
+                  if (publishResult.statusName === "PUBLISHED" || publishResult.statusName === "IN REVIEW" || publishResult.statusName === "REJECTED") {
+                    await sendTelegramAttachment(finalShotPath, "image", notifyMsg);
+                  } else {
+                    await sendTelegramNotification(notifyMsg);
+                  }
+
+                } catch (uploadErr) {
+                  console.error(`❌ Upload ${uploadNum} failed with a technical error: ${uploadErr.message}`);
+                  if (queueItem?.id) {
+                    await markWallpaperFailed(queueItem.id, uploadErr.message).catch(() => {});
+                  }
+                  // Take a failure screenshot and continue to next upload
+                  const errShotPath = `zedge-error-upload-${uploadNum}.png`;
+                  await page.screenshot({ path: errShotPath, fullPage: true }).catch(() => {});
+                  console.log("Continuing to next upload despite error...");
+                  // Notify user of upload failure
+                  failedCount++;
+                  try {
+                    const errSnippet = tgEscape(String(uploadErr.message || "Unknown error").slice(0, 160));
+                    const uploadErrMsg = tgCard(
+                      `❌ <b>আপলোড ব্যর্থ</b>`,
+                      [
+                        ["👋", `${getDhakaGreeting()}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", ctypeLabel(queueItem)],
+                        ["🏷 টাইটেল:", `<b>“${tgEscape(queueItem?.title || queueItem?.name || "N/A")}”</b>`],
+                        ["🧩 ত্রুটি:", `<code>${errSnippet}</code>`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      "🔁 ফাইলটি কিউতে <b>failed</b> মার্ক করা হয়েছে (ড্যাশবোর্ড থেকে requeue করতে পারেন)। পরবর্তী ফাইলে যাচ্ছি…"
+                    );
+                    if (fs.existsSync(errShotPath)) {
+                      await sendTelegramAttachment(errShotPath, "image", uploadErrMsg);
+                    } else {
+                      await sendTelegramNotification(uploadErrMsg);
+                    }
+                  } catch (_) {}
+                }
+
+                // Advance to the next profile still under its per-profile limit.
+                // Successful uploads increment profileUploadCounts and will be skipped once at limit.
+                // Failed uploads do NOT increment the count so they may be retried on a future run.
+                currentProfileIndex = getNextAvailableProfile(currentProfileIndex, currentState.profileUploadCounts, TOTAL_PROFILES, perProfileLimit);
+                if (currentProfileIndex === -1) {
+                  console.log("All profiles have uploaded today. No further uploads this run.");
+                  break;
+                }
+
+                // Small pause between uploads to avoid looking like a bot
+                if (i < remainingUploads - 1) {
+                  console.log("Waiting 3 seconds before next upload...");
+                  await page.waitForTimeout(3000);
+                }
+              }
+
+              console.log(`\n🏁 Run complete. ${successCount} upload(s) succeeded.`);
+              clearInterval(vpnCheck);
+
+              // Save video recording before closing browser
+              console.log("\n📹 Saving screen recording...");
+              let savedVideoPath = "";
+              try {
+                const pages = context.pages();
+                if (pages.length > 0) {
+                  const videoPath = await pages[0].video()?.path();
+                  if (videoPath) {
+                    console.log(`✅ Video saved to: ${videoPath}`);
+                    savedVideoPath = videoPath;
+                  }
+                }
+              } catch (videoErr) {
+                console.warn("⚠️ Could not retrieve video path:", videoErr.message);
+              }
+
+              await context.close();
+              // Wait 2 seconds for video to finish writing to disk
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              console.log("✅ Video recording finalized.");
+
+              if (savedVideoPath) {
+                console.log("Sending video to Telegram...");
+                const attempted = successCount + failedCount;
+                const published = successCount - removedCount;
+                const runHeader = failedCount === 0
+                  ? `🏁 <b>রান সম্পন্ন</b>`
+                  : `🏁 <b>রান শেষ — আংশিক সফল</b>`;
+                const videoCaption = tgCard(
+                  runHeader,
+                  [
+                    ["👋", `${getDhakaGreeting()}।`],
+                    ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                    ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                    ["📊 ফলাফল:", `${published} লাইভ/রিভিউ · ${removedCount} সরানো · ${failedCount} ব্যর্থ (মোট ${attempted})`],
+                    ["📈 আজ মোট:", `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI} আপলোড`],
+                    ["⏱ সময় লেগেছে:", fmtDuration(Date.now() - runStartedAt)],
+                    ["🕒 শেষ:", fmtDhakaTime()]
+                  ],
+                  "🎬 পুরো রানের স্ক্রিন রেকর্ডিং সংযুক্ত।"
+                );
+                await sendTelegramAttachment(savedVideoPath, "video", videoCaption, { width: fpVP.width, height: fpVP.height });
+              }
+
+              await browser.close();
+              
+              // Exit cleanly
+              process.exit(0);
+
+            } catch (err) {
+              console.error("BOT FATAL ERROR:", err);
+              // Notify user of fatal crash before exiting
+              try {
+                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashSnippet = tgEscape(String(err?.message || err || "Unknown fatal error").slice(0, 200));
+                const fatalMsg = [
+                  `🚨 <b>সিস্টেম ক্র্যাশ রিপোর্ট</b>`,
+                  "━━━━━━━━━━━━━━━━",
+                  `👋 ${getDhakaGreeting()}।`,
+                  `📁 প্রজেক্ট: ${tgEscape(crashFolder)}`,
+                  `📝 অবস্থা: রান চলাকালে মারাত্মক ত্রুটি — রান বন্ধ হয়ে গেছে।`,
+                  `🧩 ত্রুটি: <code>${crashSnippet}</code>`,
+                  `🕒 সময়: ${fmtDhakaTime()}`,
+                  "",
+                  "🔎 GitHub Actions লগ দেখুন। ক্র্যাশ রেকর্ডিং থাকলে পরের মেসেজে পাবেন।"
+                ].join("\n");
+                await sendTelegramNotification(fatalMsg);
+              } catch (_) {}
+
+              let fatalVideoPath = "";
+              try {
+                if (context) {
+                  const pages = context.pages();
+                  if (pages.length > 0) {
+                    fatalVideoPath = await pages[0].video()?.path() || "";
+                  }
+                }
+              } catch (_) {}
+
+              if (context) await context.close().catch(() => {});
+              if (fatalVideoPath) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const videoCaption = `🎬 <b>ক্র্যাশ রেকর্ডিং</b> · ${tgEscape(crashFolder)} · ${fmtDhakaTime()}`;
+                await sendTelegramAttachment(fatalVideoPath, "video", videoCaption).catch(() => {});
+              }
+              if (browser) await browser.close().catch(() => {});
+              process.exit(1);
+            }
+          })();
+          '@ | Set-Content bot.js
+
+      - name: Connect Proton VPN (WireGuard)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          choco install wireguard -y --no-progress
+          $wg = "C:\Program Files\WireGuard\wireguard.exe"
+          if (-not (Test-Path $wg)) { Write-Error "WireGuard binary not found"; exit 1 }
+          Write-Host "WireGuard: $wg"
+
+          # 1) The secret must actually exist
+          if ([string]::IsNullOrWhiteSpace($env:VPN_CONFIG)) {
+            Write-Error "VPN_CONFIG secret is EMPTY or not set. Add it under repo Settings > Secrets and variables > Actions."
+            exit 1
+          }
+          Write-Host ("VPN_CONFIG length: {0} chars" -f $env:VPN_CONFIG.Length)
+
+          # 2) Write config, normalizing CRLF -> LF
+          $confPath = Join-Path $PWD "proton.conf"
+          $cfg = $env:VPN_CONFIG -replace "`r`n", "`n"
+          [System.IO.File]::WriteAllText($confPath, $cfg)
+
+          # 3) Show parsed fields (secret values redacted) so a bad config is obvious
+          function Get-Field([string]$name, [string]$text) {
+            $m = [regex]::Match($text, "(?im)^\s*" + $name + "\s*=\s*(.+?)\s*$")
+            if ($m.Success) { return $m.Groups[1].Value.Trim() } else { return $null }
+          }
+          function Show-Field([string]$label, [string]$val, [bool]$secret) {
+            if ([string]::IsNullOrWhiteSpace($val)) { Write-Host "  $label = MISSING" }
+            elseif ($secret) { Write-Host "  $label = present (length $($val.Length))" }
+            else { Write-Host "  $label = $val" }
+          }
+          $cfgText = Get-Content $confPath -Raw
+          $priv = Get-Field 'PrivateKey' $cfgText
+          $pub  = Get-Field 'PublicKey'  $cfgText
+          $addr = Get-Field 'Address'    $cfgText
+          $dns  = Get-Field 'DNS'        $cfgText
+          $endp = Get-Field 'Endpoint'   $cfgText
+          $aips = Get-Field 'AllowedIPs' $cfgText
+          Write-Host "Parsed proton.conf (secrets redacted):"
+          Show-Field 'PrivateKey' $priv $true
+          Show-Field 'PublicKey'  $pub  $true
+          Show-Field 'Address'    $addr $false
+          Show-Field 'DNS'        $dns  $false
+          Show-Field 'Endpoint'   $endp $false
+          Show-Field 'AllowedIPs' $aips $false
+          if (-not $priv -or -not $endp -or -not $addr) {
+            Write-Error "proton.conf is missing PrivateKey/Address/Endpoint. Re-copy the FULL WireGuard config into the secret."
+            exit 1
+          }
+          # 3b) STRICT validation: wrong config => show exact problem + CANCEL
+          $cfgErrors = @()
+          if ($priv -notmatch '^[A-Za-z0-9+/]{43}=$') { $cfgErrors += "PrivateKey INVALID: length $($priv.Length), expected a 44-char base64 WireGuard key ending with '='. You probably pasted a placeholder or partial key." }
+          if ($pub -and $pub -notmatch '^[A-Za-z0-9+/]{43}=$') { $cfgErrors += "PublicKey INVALID: length $($pub.Length), expected a 44-char base64 WireGuard key ending with '='." }
+          if ($endp -notmatch ':\d{1,5}$') { $cfgErrors += "Endpoint INVALID: '$endp' must look like host:port (e.g. 1.2.3.4:51820)." }
+          if ($addr -notmatch '^[0-9a-fA-F\.:]+(/\d{1,3})?(\s*,\s*[0-9a-fA-F\.:]+(/\d{1,3})?)*$') { $cfgErrors += "Address INVALID: '$addr' must be an IP/CIDR like 10.2.0.2/32." }
+          if (-not ($cfgText -match '(?im)^\s*\[Interface\]')) { $cfgErrors += "Config missing [Interface] section - this is not a valid WireGuard config." }
+          if (-not ($cfgText -match '(?im)^\s*\[Peer\]')) { $cfgErrors += "Config missing [Peer] section - this is not a valid WireGuard config." }
+          if ($cfgErrors.Count -gt 0) {
+            Write-Host "=================== VPN CONFIG IS WRONG ==================="
+            $cfgErrors | ForEach-Object { Write-Host "  ERROR: $_" }
+            Write-Host "Fix the VPN_CONFIG secret: copy the FULL WireGuard config file from Proton VPN (Downloads > WireGuard configuration) and paste it exactly."
+            Write-Host "==========================================================="
+            Write-Error "Invalid WireGuard config - cancelling workflow before connecting."
+            exit 1
+          }
+          Write-Host "Config validation passed."
+
+          $ipBefore = $null
+          try { $ipBefore = (Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 10).ToString().Trim() } catch { Write-Host "(IP lookup before VPN failed)" }
+          Write-Host "IP before VPN: $ipBefore"
+
+          # 4) Install tunnel service, then start with retries (~30s)
+          & $wg /installtunnelservice $confPath
+          "proton" | Out-File -FilePath (Join-Path $PWD "vpn.tunnel") -Encoding ascii -NoNewline
+          $svcName = 'WireGuardTunnel$proton'
+          $svc = $null
+          for ($i = 1; $i -le 6; $i++) {
+            Start-Sleep -Seconds 5
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc) {
+              if ($svc.Status -ne 'Running') {
+                try { Start-Service -Name $svcName -ErrorAction Stop } catch { Write-Host "start error: $($_.Exception.Message)" }
+              }
+              $svc.Refresh()
+              Write-Host "Attempt $i -> service status: $($svc.Status)"
+              if ($svc.Status -eq 'Running') { break }
+            } else {
+              Write-Host "Attempt $i -> service not created yet"
+            }
+          }
+
+          # 5) Still not running? Dump WireGuard's OWN tunnel log = the exact reason
+          if (-not $svc -or $svc.Status -ne 'Running') {
+            Write-Host "=================== WireGuard tunnel did NOT start ==================="
+            $logPath = "C:\Program Files\WireGuard\Data\log.bin"
+            if (-not (Test-Path $logPath)) {
+              $f = Get-ChildItem "C:\Program Files\WireGuard" -Recurse -Filter 'log.bin' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($f) { $logPath = $f.FullName }
+            }
+            if (Test-Path $logPath) {
+              Write-Host "--- WireGuard tunnel log ---"
+              try {
+                $fs = [System.IO.File]::Open($logPath, 'Open', 'Read', 'ReadWrite')
+                $b = New-Object byte[] $fs.Length
+                [void]$fs.Read($b, 0, $b.Length)
+                $fs.Close()
+                $maxLines = 2048; $lineLen = 512; $rec = 520
+                $nextIndex = [BitConverter]::ToUInt32($b, 4)
+                for ($n = 0; $n -lt $maxLines; $n++) {
+                  $idx = ($nextIndex + $n) % $maxLines
+                  $off = 8 + $idx * $rec
+                  if ($off + $rec -gt $b.Length) { continue }
+                  $timeNs = [BitConverter]::ToInt64($b, $off)
+                  if ($timeNs -eq 0) { continue }
+                  $z = [Array]::IndexOf($b, [byte]0, $off + 8)
+                  $len = if ($z -ge ($off + 8) -and $z -lt ($off + 8 + $lineLen)) { $z - ($off + 8) } else { $lineLen }
+                  if ($len -le 0) { continue }
+                  $text = [System.Text.Encoding]::UTF8.GetString($b, $off + 8, $len)
+                  Write-Host "  $text"
+                }
+              } catch { Write-Host "  (could not parse log.bin: $($_.Exception.Message))" }
+            } else {
+              Write-Host "--- No log.bin found; tunnel never initialized its log ---"
+            }
+            Write-Host "--- Service Control Manager (System log) ---"
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 40 -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -like '*proton*' -or $_.Message -like '*WireGuard*' } |
+              Select-Object -First 6 TimeCreated, Id, Message | Format-List
+            Write-Host "====================================================================="
+            Write-Host "Read the tunnel log above for the exact cause (bad key, DNS/endpoint resolve, adapter creation, etc.)."
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "WireGuard tunnel failed to start - cancelling workflow."
+            exit 1
+          }
+
+          # 6) VERIFY the VPN is really working: IP must change
+          $ipAfter = $null
+          $ipInfo = $null
+          for ($i = 1; $i -le 5; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 10
+              $ipAfter = $ipInfo.ip.ToString().Trim()
+              if ($ipAfter) { break }
+            } catch { Write-Host "IP check attempt $i failed, retrying..." }
+          }
+          if ([string]::IsNullOrWhiteSpace($ipAfter)) {
+            Write-Host "=================== VPN VERIFICATION FAILED ==================="
+            Write-Host "Tunnel service is running but no internet through VPN (IP lookup failed 5 times)."
+            Write-Host "Likely causes: wrong PrivateKey (handshake fails silently), dead Endpoint, or DNS issue."
+            Write-Host "==============================================================="
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "No connectivity through VPN - cancelling workflow."
+            exit 1
+          }
+          if ($ipBefore -and ($ipAfter -eq $ipBefore)) {
+            Write-Host "=================== VPN VERIFICATION FAILED ==================="
+            Write-Host "IP did NOT change (before: $ipBefore, after: $ipAfter). Traffic is NOT going through the VPN."
+            Write-Host "Likely causes: wrong AllowedIPs (should be 0.0.0.0/0), or handshake failed due to a bad key."
+            Write-Host "==============================================================="
+            try { & $wg /uninstalltunnelservice proton 2>$null } catch { }
+            Write-Error "VPN not routing traffic - cancelling workflow."
+            exit 1
+          }
+          Write-Host "==================== VPN CONNECTED OK ===================="
+          Write-Host ("Connected IP : {0}" -f $ipAfter)
+          if ($ipInfo) {
+            Write-Host ("Location     : {0}, {1} ({2})" -f $ipInfo.city, $ipInfo.region, $ipInfo.country)
+            Write-Host ("Provider     : {0}" -f $ipInfo.org)
+          }
+          Write-Host "==========================================================="
+          Write-Host "WireGuard connected successfully"
+        env:
+          VPN_CONFIG: ${{ secrets.VPN_CONFIG }}
+
+      - name: Run bot
+        shell: pwsh
+        env:
+          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email }}
+          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
+          HEADLESS: ${{ github.event.inputs.headless }}
+          TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
+          UA_GROUP: ${{ github.event.inputs.ua_group }}
+          # Optional - create these two repository secrets to receive Telegram reports
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOLDER_NAME: "Zedge 1"
+
+        run: node bot.js

@@ -1,3 +1,4 @@
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
@@ -54,7 +55,7 @@ compose.desktop {
     application {
         mainClass = "com.metamonjurul.MainKt"
         nativeDistributions {
-            packageTypes = setOf("dmg", "msi", "deb", "tar")
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "MetaMonjurul"
             description = "Meta Monjurul - Stock Marketplace Metadata Automation"
             vendor = "Meta Monjurul"

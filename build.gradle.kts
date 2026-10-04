@@ -55,6 +55,18 @@ compose.desktop {
         mainClass = "com.metamonjurul.MainKt"
         nativeDistributions {
             packageTypes = setOf("dmg", "msi", "deb", "tar")
+            packageName = "MetaMonjurul"
+            description = "Meta Monjurul - Stock Marketplace Metadata Automation"
+            vendor = "Meta Monjurul"
+            // App icons (replaces the Compose defaults).
+            // These files ship in the repo: assets/icon/app_icon.ico (.ico)
+            // and assets/icon/app_icon_256.png (.png).
+            windows {
+                iconFile.set(project.file("assets/icon/app_icon.ico"))
+            }
+            linux {
+                iconFile.set(project.file("assets/icon/app_icon_256.png"))
+            }
         }
     }
 }

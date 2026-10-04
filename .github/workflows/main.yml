@@ -4,25 +4,26 @@ name: Build Desktop App
 # Windows, and optionally Linux + macOS, on GitHub's own machines - no
 # Gradle / JDK needed on your PC.
 #
-# How to use (same idea as the Meta Hawladar `main (1).yml`):
+# How to use (same idea as the Meta Hawladar yml):
 #   1. Push this folder to a GitHub repository (the folder itself as
 #      the repo root, OR the whole bundle - the workflow finds
 #      build.gradle.kts).
 #   2. GitHub -> Actions -> "Build Desktop App" -> Run workflow.
 #   3. When it finishes, open the run -> Artifacts -> download
-#      `MetaMonjurul-windows-x64-setup-v<version>` -> inside is the
-#      real Windows installer (`...-setup-v<version>.msi`): double-click
-#      -> Next -> Install. It adds Start-menu + Desktop shortcuts and an
-#      "Apps & features" uninstall entry, and upgrades in place when you
-#      install a newer version.
-#      The portable build `MetaMonjurul-windows-x64-v<version>.zip`
-#      (extract + run the .exe, no install) is still
+#      `MetaMonjurul-<profile>-windows-x64-setup-v<version>` -> inside is the
+#      real Windows installer (`...-setup-v<version>.exe`, built with Inno
+#      Setup): double-click -> Next -> Install. It goes to Program Files (or
+#      the per-user Programs folder without admin), adds Start-menu + Desktop
+#      shortcuts and an "Apps & features" uninstall entry, and upgrades in
+#      place when you install a newer version.
+#      The portable build `MetaMonjurul-<profile>-windows-x64-v<version>.zip`
+#      (extract + run `MetaMonjurul.exe`, no install) is still
 #      uploaded next to it.
 #   4. Push a version tag (`git tag v1.0.0 && git push --tags`) to also get a
 #      GitHub Release with every platform attached.
 #
-# No secrets are required. Gradle comes from gradle/actions/setup-gradle
-# (no gradle-wrapper.jar needed in the repo).
+# No secrets are required. BUILD_PROFILE goes into the artifact names
+# (see artifact `name:` fields below).
 
 on:
   workflow_dispatch:
@@ -43,12 +44,13 @@ permissions:
   contents: write   # needed to create the GitHub Release on tag pushes
 
 env:
-  # JDK + Gradle used on the build machines. Pinned on purpose:
-  # Compose Desktop 1.6.10 + Kotlin 2.0.0 need JDK 17+; 21 is the LTS sweet
-  # spot. Bump only after testing the full matrix locally.
+  # JDK + Gradle versions used on the build machines. Pinned on purpose:
+  # Compose Desktop 1.6.10 + Kotlin 2.0.0 need JDK 17+ (21 is the LTS sweet
+  # spot). Bump only after testing the full matrix.
   JAVA_VERSION: "21"
-  GRADLE_VERSION: "8.7"
   JAVA_DIST: temurin
+  GRADLE_VERSION: "8.7"
+  BUILD_PROFILE: template
   # Set to the sub-folder that contains build.gradle.kts, or leave "auto" to
   # let the workflow find it (repo root, ./desktop or ./meta-monjurul).
   PROJECT_DIR: auto
@@ -70,7 +72,7 @@ jobs:
           set -euo pipefail
           DIR="${PROJECT_DIR}"
           if [ "$DIR" = "auto" ]; then
-            for c in . desktop meta-monjurul MetaMonjurul; do
+            for c in . desktop meta-monjurul; do
               if [ -f "$c/build.gradle.kts" ]; then DIR="$c"; break; fi
             done
           fi
@@ -96,23 +98,35 @@ jobs:
         working-directory: ${{ steps.dir.outputs.dir }}
         run: gradle --version
 
-      - name: Build Windows release (MSI)
+      - name: Apply app icon (replaces the Compose default icon)
         working-directory: ${{ steps.dir.outputs.dir }}
-        run: gradle packageMsi --no-daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build.gradle.kts points nativeDistributions at these files
+          test -f assets/icon/app_icon.ico || { echo "::error::assets/icon/app_icon.ico not found"; exit 1; }
+          ls -la assets/icon/
+          grep -n "iconFile" build.gradle.kts | head -n 5
 
-      - name: Package portable zip
+      - name: Resolve dependencies
+        working-directory: ${{ steps.dir.outputs.dir }}
+        run: gradle -q help
+
+      - name: Build Windows release
+        working-directory: ${{ steps.dir.outputs.dir }}
+        run: gradle createDistributable --no-daemon
+
+      - name: Package
         id: pkg
         working-directory: ${{ steps.dir.outputs.dir }}
         shell: pwsh
         run: |
-          $ver = "${{ steps.dir.outputs.version }}"
-          $out = "MetaMonjurul-windows-x64-v$ver"
-          # Compose Desktop native exe lives next to the .msi output
-          $bin = Get-ChildItem -Directory -Recurse "build/compose/binaries" | Where-Object { $_.FullName -match 'main\\(app|exe)$' } | Select-Object -First 1
-          if (-not $bin) { $bin = Get-ChildItem -Directory -Recurse "build/compose" | Where-Object { $_.Name -in @("app","exe") } | Select-Object -First 1 }
-          if (-not $bin) { Write-Error "Portable app folder not found under build/compose"; exit 1 }
+          $out = "MetaMonjurul-${env:BUILD_PROFILE}-windows-x64-v${{ steps.dir.outputs.version }}"
+          $rel = Get-ChildItem -Directory -Recurse build/compose/binaries | Where-Object { $_.FullName -match 'main\\app\\[^\\]+$' } | Select-Object -First 1
+          if (-not $rel) { $rel = Get-ChildItem -Directory -Recurse build/compose | Where-Object { (Get-ChildItem -Path $_.FullName -Filter *.exe -File | Select-Object -First 1) } | Select-Object -First 1 }
+          if (-not $rel) { Write-Error "Portable app folder not found under build/compose"; exit 1 }
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/dist/$out" | Out-Null
-          Copy-Item -Path "$($bin.FullName)/*" -Destination "$env:RUNNER_TEMP/dist/$out" -Recurse
+          Copy-Item -Path "$($rel.FullName)/*" -Destination "$env:RUNNER_TEMP/dist/$out" -Recurse
           Copy-Item -Path README.md -Destination "$env:RUNNER_TEMP/dist/$out/README.md" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$env:RUNNER_TEMP/dist/$out" -DestinationPath "$env:RUNNER_TEMP/dist/$out.zip" -Force
           "path=$env:RUNNER_TEMP/dist/$out.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -127,26 +141,39 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Real Windows installer: Compose Desktop already builds a proper .msi
-      # (per-machine / per-user, Start-menu + Desktop shortcuts, uninstall
-      # entry) - this step just renames it to the release convention.
-      - name: Rename Windows installer (MSI)
+      # Real Windows installer (setup.exe) built with Inno Setup 6, which is
+      # pre-installed on the GitHub windows runners. Script lives in
+      # installer/ (installer/windows.iss).
+      - name: Build Windows installer (Inno Setup)
         id: inst
         working-directory: ${{ steps.dir.outputs.dir }}
         shell: pwsh
         run: |
-          $ver = "${{ steps.dir.outputs.version }}"
-          $msi = Get-ChildItem -File -Recurse "build/compose/binaries" -Filter *.msi | Select-Object -First 1
-          if (-not $msi) { Write-Error "MSI installer not found under build/compose/binaries"; exit 1 }
-          $name = "MetaMonjurul-windows-x64-setup-v$ver"
+          # exit codes are checked explicitly below (native stderr chatter must not abort the step)
+          $ErrorActionPreference = "Continue"
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found on runner - installing via Chocolatey"
+            choco install innosetup --no-progress -y | Out-Null
+          }
+          if (-not (Test-Path $iscc)) { Write-Error "ISCC.exe not found at $iscc"; exit 1 }
+          $rel = Get-ChildItem -Directory -Recurse build/compose/binaries | Where-Object { $_.FullName -match 'main\\app\\[^\\]+$' } | Select-Object -First 1
+          if (-not $rel) { $rel = Get-ChildItem -Directory -Recurse build/compose | Where-Object { (Get-ChildItem -Path $_.FullName -Filter *.exe -File | Select-Object -First 1) } | Select-Object -First 1 }
+          if (-not $rel) { Write-Error "Portable app folder not found under build/compose"; exit 1 }
+          $ver  = "${{ steps.dir.outputs.version }}"
+          $name = "MetaMonjurul-${env:BUILD_PROFILE}-windows-x64-setup-v$ver"
           $outDir = Join-Path $env:RUNNER_TEMP "dist-installer"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-          $dest = Join-Path $outDir "$name.msi"
-          Copy-Item -Path $msi.FullName -Destination $dest -Force
-          Get-Item $dest | Format-List Name, Length
-          "path=$dest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $exeFile = Get-ChildItem -Path $rel.FullName -Filter *.exe -File | Select-Object -First 1
+          if (-not $exeFile) { Write-Error "No .exe in $($rel.FullName)"; exit 1 }
+          & $iscc "/DMyAppExeName=$($exeFile.Name)" "/DMyAppVersion=$ver" "/DMyProfile=${env:BUILD_PROFILE}" "/DMySourceDir=$($rel.FullName)" "/DMyOutputDir=$outDir" "/DMyOutputBaseFilename=$name" "installer\windows.iss"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Inno Setup compile failed ($LASTEXITCODE)"; exit 1 }
+          $exe = Join-Path $outDir "$name.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Installer not produced: $exe"; exit 1 }
+          Get-Item $exe | Format-List Name, Length
+          "path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Built $name.msi"
+          Write-Host "Built $name.exe"
 
       - name: Upload artifact (Windows installer)
         uses: actions/upload-artifact@v4
@@ -172,7 +199,7 @@ jobs:
           set -euo pipefail
           DIR="${PROJECT_DIR}"
           if [ "$DIR" = "auto" ]; then
-            for c in . desktop meta-monjurul MetaMonjurul; do
+            for c in . desktop meta-monjurul; do
               if [ -f "$c/build.gradle.kts" ]; then DIR="$c"; break; fi
             done
           fi
@@ -198,20 +225,28 @@ jobs:
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Build Linux release (DEB)
+      - name: Apply app icon
         working-directory: ${{ steps.dir.outputs.dir }}
-        run: gradle packageDeb --no-daemon
+        run: |
+          set -euo pipefail
+          test -f assets/icon/app_icon_256.png || { echo "::error::assets/icon/app_icon_256.png not found"; exit 1; }
+          ls -la assets/icon/
+          grep -n "iconFile" build.gradle.kts | head -n 5 || echo "::warning::iconFile not wired in build.gradle.kts (default icon kept)"
+
+      - name: Build Linux release
+        working-directory: ${{ steps.dir.outputs.dir }}
+        run: gradle createDistributable --no-daemon
 
       - name: Package
         id: pkg
         working-directory: ${{ steps.dir.outputs.dir }}
         run: |
           set -euo pipefail
-          OUT="MetaMonjurul-linux-x64-v${{ steps.dir.outputs.version }}"
-          DEB=$(find build/compose -name '*.deb' | head -n1)
-          [ -n "$DEB" ] || { echo "::error::.deb not found"; exit 1; }
+          OUT="MetaMonjurul-${BUILD_PROFILE}-linux-x64-v${{ steps.dir.outputs.version }}"
+          BUNDLE=$(find build/compose -type d -path '*main/app*' | head -n1)
+          [ -n "$BUNDLE" ] || { echo "::error::app bundle not found"; exit 1; }
           mkdir -p "$RUNNER_TEMP/dist/$OUT"
-          cp "$DEB" "$RUNNER_TEMP/dist/$OUT/"
+          cp -r "$BUNDLE"/. "$RUNNER_TEMP/dist/$OUT/"
           cp README.md "$RUNNER_TEMP/dist/$OUT/" || true
           tar -C "$RUNNER_TEMP/dist" -czf "$RUNNER_TEMP/dist/$OUT.tar.gz" "$OUT"
           echo "path=$RUNNER_TEMP/dist/$OUT.tar.gz" >> "$GITHUB_OUTPUT"
@@ -241,7 +276,7 @@ jobs:
           set -euo pipefail
           DIR="${PROJECT_DIR}"
           if [ "$DIR" = "auto" ]; then
-            for c in . desktop meta-monjurul MetaMonjurul; do
+            for c in . desktop meta-monjurul; do
               if [ -f "$c/build.gradle.kts" ]; then DIR="$c"; break; fi
             done
           fi
@@ -262,21 +297,29 @@ jobs:
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Build macOS release (DMG)
+      - name: Apply app icon
         working-directory: ${{ steps.dir.outputs.dir }}
-        run: gradle packageDmg --no-daemon
+        run: |
+          set -euo pipefail
+          ls macos 2>/dev/null || true
+          ls assets/icon/macos/ | head -n 10
+          test -f assets/icon/macos/app_icon_512.png || { echo "::error::macos icons not found"; exit 1; }
+
+      - name: Build macOS release
+        working-directory: ${{ steps.dir.outputs.dir }}
+        run: gradle createDistributable --no-daemon
 
       - name: Package
         id: pkg
         working-directory: ${{ steps.dir.outputs.dir }}
         run: |
           set -euo pipefail
-          OUT="MetaMonjurul-macos-v${{ steps.dir.outputs.version }}"
-          DMG=$(find build/compose -name '*.dmg' | head -n1)
-          [ -n "$DMG" ] || { echo "::error::.dmg not found"; exit 1; }
+          OUT="MetaMonjurul-${BUILD_PROFILE}-macos-v${{ steps.dir.outputs.version }}"
+          APP=$(find build/compose -type d -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::.app not found"; exit 1; }
           mkdir -p "$RUNNER_TEMP/dist"
-          cp "$DMG" "$RUNNER_TEMP/dist/$OUT.dmg"
-          echo "path=$RUNNER_TEMP/dist/$OUT.dmg" >> "$GITHUB_OUTPUT"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/dist/$OUT.zip"
+          echo "path=$RUNNER_TEMP/dist/$OUT.zip" >> "$GITHUB_OUTPUT"
           echo "name=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
@@ -303,13 +346,13 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          name: Meta Monjurul Desktop ${{ github.ref_name }}
+          name: Meta Monjurul Desktop ${{ github.ref_name }} (${{ env.BUILD_PROFILE }})
           files: dist/**
           generate_release_notes: true
           body: |
-            Meta Monjurul desktop app **${{ github.ref_name }}**.
+            Meta Monjurul desktop app **${{ github.ref_name }}** - profile `${{ env.BUILD_PROFILE }}`.
 
-            * Windows (recommended): run `MetaMonjurul-windows-x64-setup-v....msi` -> Next -> Install (Start-menu + Desktop shortcut, uninstall from Apps & features). Unsigned build: if SmartScreen shows "Windows protected your PC", click *More info -> Run anyway*.
-            * Windows portable: extract `MetaMonjurul-windows-x64-v....zip` and run the `.exe` (keep all files together).
-            * Linux: install the `.deb` from the tarball (`sudo apt install ./....deb`).
-            * macOS: open the `.dmg`, drag the app to Applications (unsigned build: right-click -> Open).
+            * Windows (recommended): run `MetaMonjurul-...-windows-x64-setup-v....exe` -> Next -> Install (Start-menu + Desktop shortcut, uninstall from Apps & features). Unsigned build: if SmartScreen shows "Windows protected your PC", click *More info -> Run anyway*.
+            * Windows portable: extract `MetaMonjurul-...-windows-x64-v....zip` and run `MetaMonjurul.exe` (keep all files together).
+            * Linux: extract the tar.gz and run the launcher script inside.
+            * macOS: unzip, right-click the app -> Open (unsigned build).
